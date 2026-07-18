@@ -14,6 +14,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import LBFGS
 from torch.utils.hooks import RemovableHandle
 from transformers import (
@@ -34,6 +35,7 @@ from transformers.generation import (
 from .aqua import (
     AQUAParameters,
     aqua_query_loss,
+    fit_protected_wall_rewire,
     fit_selective_output_update,
     validate_query_sets,
 )
@@ -838,6 +840,11 @@ class Model:
                 "AQUA-OPEN output_max_relative_update must be between 0 and 1; "
                 f"got {parameters.output_max_relative_update}."
             )
+        if not 0.0 <= parameters.routing_max_relative_update <= 1.0:
+            raise ValueError(
+                "AQUA-OPEN routing_max_relative_update must be between 0 and 1; "
+                f"got {parameters.routing_max_relative_update}."
+            )
 
         for layer_index in range(
             parameters.start_layer_index,
@@ -849,7 +856,8 @@ class Model:
 
                 for module_index, module in enumerate(routing_modules):
                     matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
-                    original_matrix = matrix.detach().clone()
+                    original_matrix = matrix.detach().float().clone()
+                    working_matrix = original_matrix.clone().requires_grad_(True)
 
                     answered_input, answered_output = answered_module_io[layer_index][
                         component
@@ -870,9 +878,33 @@ class Model:
                         parameters.neighbor_count,
                     )
 
+                    original_row_norms = LA.vector_norm(
+                        original_matrix,
+                        dim=1,
+                        keepdim=True,
+                    )
+                    maximum_routing_update = (
+                        parameters.routing_max_relative_update
+                        * LA.vector_norm(original_matrix)
+                    )
+
                     def objective(weight: Tensor) -> Tensor:
-                        effective_weight = weight.float()
-                        update = effective_weight - original_matrix.float()
+                        raw_update = weight.float() - original_matrix
+                        raw_update_norm = LA.vector_norm(raw_update)
+                        update_scale = torch.clamp(
+                            maximum_routing_update
+                            / raw_update_norm.clamp_min(
+                                torch.finfo(raw_update_norm.dtype).eps
+                            ),
+                            max=1.0,
+                        )
+                        bounded_weight = original_matrix + update_scale * raw_update
+                        effective_weight = original_row_norms * F.normalize(
+                            bounded_weight,
+                            p=2,
+                            dim=1,
+                        )
+                        update = effective_weight - original_matrix
                         new_answered_output = answered_input @ effective_weight.T
                         new_refused_output = refused_input @ effective_weight.T
                         return aqua_query_loss(
@@ -885,35 +917,76 @@ class Model:
                         )
 
                     optimizer = LBFGS(
-                        [matrix],
-                        lr=0.5,
-                        max_iter=20,
-                        history_size=10,
+                        [working_matrix],
+                        lr=0.25,
+                        max_iter=12,
+                        history_size=5,
                         line_search_fn="strong_wolfe",
                     )
 
                     def closure() -> Tensor:
                         optimizer.zero_grad()
-                        loss = objective(matrix)
+                        loss = objective(working_matrix)
                         if not torch.isfinite(loss):
                             raise FloatingPointError(
                                 f"AQUA-OPEN produced a non-finite loss in layer "
                                 f"{layer_index} ({component})."
                             )
                         loss.backward()
-                        return loss
-
-                    for _ in range(5):
-                        optimizer.step(closure)
-                        if not torch.isfinite(matrix).all():
-                            with torch.no_grad():
-                                matrix.copy_(original_matrix.to(matrix.dtype))
+                        if (
+                            working_matrix.grad is None
+                            or not torch.isfinite(working_matrix.grad).all()
+                        ):
                             raise FloatingPointError(
-                                f"AQUA-OPEN produced non-finite weights in layer "
+                                f"AQUA-OPEN produced a non-finite gradient in layer "
                                 f"{layer_index} ({component})."
                             )
+                        gradient_norm = clip_grad_norm_([working_matrix], max_norm=1.0)
+                        if not torch.isfinite(gradient_norm):
+                            raise FloatingPointError(
+                                f"AQUA-OPEN produced a non-finite gradient norm in "
+                                f"layer {layer_index} ({component})."
+                            )
+                        return loss
 
-            if parameters.output_transport_strength == 0.0:
+                    try:
+                        for _ in range(4):
+                            optimizer.step(closure)
+                            with torch.no_grad():
+                                if not torch.isfinite(working_matrix).all():
+                                    raise FloatingPointError(
+                                        "AQUA-OPEN produced non-finite routing "
+                                        f"weights in layer {layer_index} ({component})."
+                                    )
+                                routing_update = working_matrix - original_matrix
+                                routing_update_norm = LA.vector_norm(routing_update)
+                                if routing_update_norm > maximum_routing_update:
+                                    routing_update = routing_update * (
+                                        maximum_routing_update
+                                        / routing_update_norm.clamp_min(
+                                            torch.finfo(routing_update_norm.dtype).eps
+                                        )
+                                    )
+                                bounded_matrix = original_matrix + routing_update
+                                working_matrix.copy_(
+                                    original_row_norms
+                                    * F.normalize(bounded_matrix, p=2, dim=1)
+                                )
+                    except FloatingPointError as error:
+                        print(
+                            "[yellow]* AQUA-OPEN skipped an unstable routing edit: "
+                            f"{error}[/]"
+                        )
+                        continue
+
+                    with torch.no_grad():
+                        matrix.copy_(working_matrix.to(matrix.dtype))
+
+            if (
+                parameters.output_transport_strength == 0.0
+                and parameters.wall_ablation_strength == 0.0
+                and parameters.wall_rewire_strength == 0.0
+            ):
                 continue
 
             # The output-side stage supplies ARA-like ablation pressure selectively.
@@ -946,18 +1019,30 @@ class Model:
                     parameters.output_ridge_weight,
                     parameters.output_protection_rank,
                 )
-                update_norm = LA.vector_norm(weight_update)
+                candidate_matrix = original_matrix + weight_update
+                wall_update = fit_protected_wall_rewire(
+                    answered_output,
+                    refused_output,
+                    candidate_matrix,
+                    parameters.neighbor_count,
+                    parameters.wall_rank,
+                    parameters.wall_ablation_strength,
+                    parameters.wall_rewire_strength,
+                    parameters.output_protection_rank,
+                )
+                combined_update = weight_update + wall_update
+                update_norm = LA.vector_norm(combined_update)
                 maximum_update_norm = (
                     parameters.output_max_relative_update
                     * LA.vector_norm(original_matrix)
                 )
                 if update_norm > maximum_update_norm:
-                    weight_update = weight_update * (
+                    combined_update = combined_update * (
                         maximum_update_norm
                         / update_norm.clamp_min(torch.finfo(update_norm.dtype).eps)
                     )
 
-                candidate_matrix = original_matrix + weight_update
+                candidate_matrix = original_matrix + combined_update
                 original_row_norms = LA.vector_norm(
                     original_matrix,
                     dim=1,
@@ -986,10 +1071,11 @@ class Model:
         export_model.config.heretic_attention_only = True
         export_model.config.heretic_routing_edit = "query-key-selective-output-ablation"
         export_model.config.heretic_output_transport = (
-            "conditional-refusal-trigger-replacement"
+            "conditional-trigger-replacement-plus-protected-wall-rewire"
         )
         export_model.config.heretic_non_ablative = False
         export_model.config.heretic_selective_ablation = True
+        export_model.config.heretic_wall_rewire = True
         export_model.config.heretic_edited_projections = [
             "attn.q_proj",
             "attn.k_proj",

@@ -570,8 +570,8 @@ def run():
             )
             output_transport_strength = trial.suggest_float(
                 "output_transport_strength",
-                0.1,
-                1.5,
+                0.75,
+                3.0,
                 log=True,
             )
             output_transport_rank = trial.suggest_categorical(
@@ -581,24 +581,44 @@ def run():
             output_preservation_weight = trial.suggest_float(
                 "output_preservation_weight",
                 0.1,
-                100.0,
+                20.0,
                 log=True,
             )
             output_ridge_weight = trial.suggest_float(
                 "output_ridge_weight",
                 0.0001,
-                1.0,
+                0.05,
                 log=True,
             )
             output_protection_rank = trial.suggest_categorical(
                 "output_protection_rank",
-                [4, 8, 16, 32],
+                [0, 2, 4, 8],
             )
             output_max_relative_update = trial.suggest_float(
                 "output_max_relative_update",
-                0.005,
+                0.1,
+                0.75,
+                log=True,
+            )
+            routing_max_relative_update = trial.suggest_float(
+                "routing_max_relative_update",
+                0.01,
                 0.2,
                 log=True,
+            )
+            wall_ablation_strength = trial.suggest_float(
+                "wall_ablation_strength",
+                0.75,
+                2.0,
+            )
+            wall_rewire_strength = trial.suggest_float(
+                "wall_rewire_strength",
+                0.5,
+                2.0,
+            )
+            wall_rank = trial.suggest_categorical(
+                "wall_rank",
+                [1, 2, 4, 8, 16],
             )
             update_norm_weight = trial.suggest_float(
                 "update_norm_weight",
@@ -626,6 +646,10 @@ def run():
                 output_ridge_weight=output_ridge_weight,
                 output_protection_rank=output_protection_rank,
                 output_max_relative_update=output_max_relative_update,
+                routing_max_relative_update=routing_max_relative_update,
+                wall_ablation_strength=wall_ablation_strength,
+                wall_rewire_strength=wall_rewire_strength,
+                wall_rank=wall_rank,
                 update_norm_weight=update_norm_weight,
                 neighbor_count=neighbor_count,
             )
@@ -754,7 +778,7 @@ def run():
             model.reset_model()
             print(
                 "* Opening attention routes "
-                "(AQUA-OPEN, query/key opening plus selective output ablation)..."
+                "(AQUA-OPEN, bounded routing plus selective wall ablation/rewiring)..."
             )
             model.aqua_align_queries(
                 good_module_io,
@@ -966,7 +990,7 @@ def run():
                 model.reset_model()
                 print(
                     "* Opening attention routes "
-                    "(AQUA-OPEN, query/key opening plus selective output ablation)..."
+                    "(AQUA-OPEN, bounded routing plus selective wall ablation/rewiring)..."
                 )
                 model.aqua_align_queries(
                     good_module_io,
@@ -1210,6 +1234,7 @@ def run():
                                             "aqua-qko",
                                             "selective-ablation",
                                             "conditional-route-replacement",
+                                            "protected-wall-rewire",
                                         ]
                                     )
                                     card.data.tags.append("attention-only")

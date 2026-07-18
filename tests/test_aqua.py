@@ -8,6 +8,7 @@ import torch
 from heretic.aqua import (
     AQUAParameters,
     aqua_query_loss,
+    fit_protected_wall_rewire,
     fit_selective_output_update,
     nearest_neighbor_targets,
     validate_query_sets,
@@ -31,6 +32,10 @@ class AQUATest(unittest.TestCase):
             output_ridge_weight=0.02,
             output_protection_rank=1,
             output_max_relative_update=0.1,
+            routing_max_relative_update=0.08,
+            wall_ablation_strength=0.75,
+            wall_rewire_strength=1.1,
+            wall_rank=1,
             update_norm_weight=0.25,
             neighbor_count=2,
         )
@@ -62,6 +67,10 @@ class AQUATest(unittest.TestCase):
         self.assertEqual(self.parameters.output_ridge_weight, 0.02)
         self.assertEqual(self.parameters.output_protection_rank, 1)
         self.assertEqual(self.parameters.output_max_relative_update, 0.1)
+        self.assertEqual(self.parameters.routing_max_relative_update, 0.08)
+        self.assertEqual(self.parameters.wall_ablation_strength, 0.75)
+        self.assertEqual(self.parameters.wall_rewire_strength, 1.1)
+        self.assertEqual(self.parameters.wall_rank, 1)
         self.assertEqual(self.parameters.neighbor_count, 2)
 
     def test_older_aqua_trial_parameters_receive_open_defaults(self):
@@ -84,6 +93,10 @@ class AQUATest(unittest.TestCase):
         self.assertEqual(parameters.output_ridge_weight, 0.01)
         self.assertEqual(parameters.output_protection_rank, 16)
         self.assertEqual(parameters.output_max_relative_update, 0.05)
+        self.assertEqual(parameters.routing_max_relative_update, 0.05)
+        self.assertEqual(parameters.wall_ablation_strength, 0.0)
+        self.assertEqual(parameters.wall_rewire_strength, 0.0)
+        self.assertEqual(parameters.wall_rank, 4)
 
     def test_nearest_neighbor_targets_do_not_require_pairs(self):
         answered = torch.tensor([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
@@ -146,6 +159,49 @@ class AQUATest(unittest.TestCase):
         )
 
         self.assertLessEqual(torch.linalg.matrix_rank(weight_update).item(), 1)
+
+    def test_protected_wall_rewire_ablates_and_redirects(self):
+        answered_outputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        refused_outputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+        weight = torch.eye(2)
+
+        weight_update = fit_protected_wall_rewire(
+            answered_outputs,
+            refused_outputs,
+            weight,
+            neighbor_count=1,
+            rank=1,
+            ablation_strength=1.0,
+            rewire_strength=1.0,
+            protection_rank=1,
+        )
+        new_outputs = refused_outputs @ (weight + weight_update).T
+        original_distance = (
+            torch.cdist(refused_outputs, answered_outputs).min(dim=1).values.mean()
+        )
+        updated_distance = (
+            torch.cdist(new_outputs, answered_outputs).min(dim=1).values.mean()
+        )
+
+        self.assertLess(updated_distance.item(), original_distance.item())
+
+    def test_wall_ablation_accepts_old_school_overcorrection(self):
+        answered_outputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        refused_outputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+
+        update = fit_protected_wall_rewire(
+            answered_outputs,
+            refused_outputs,
+            torch.eye(2),
+            neighbor_count=1,
+            rank=1,
+            ablation_strength=2.0,
+            rewire_strength=0.0,
+            protection_rank=0,
+        )
+
+        self.assertTrue(torch.isfinite(update).all())
+        self.assertLessEqual(torch.linalg.matrix_rank(update).item(), 1)
 
     def test_open_queries_are_preferred_over_refusal_neighborhood(self):
         parameters = AQUAParameters(

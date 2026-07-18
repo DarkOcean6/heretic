@@ -35,6 +35,10 @@ class AQUAParameters:
     output_ridge_weight: float = 0.01
     output_protection_rank: int = 16
     output_max_relative_update: float = 0.05
+    routing_max_relative_update: float = 0.05
+    wall_ablation_strength: float = 0.0
+    wall_rewire_strength: float = 0.0
+    wall_rank: int = 4
 
 
 def validate_query_sets(
@@ -278,6 +282,147 @@ def fit_selective_output_update(
     return weight_update
 
 
+def fit_protected_wall_rewire(
+    answered_outputs: Tensor,
+    refused_outputs: Tensor,
+    weight: Tensor,
+    neighbor_count: int,
+    rank: int,
+    ablation_strength: float,
+    rewire_strength: float,
+    protection_rank: int,
+) -> Tensor:
+    """Return a protected output-wall ablation and answer-route update.
+
+    Refused outputs are compared with unpaired nearest answered outputs. The top
+    difference directions are projected away from high-variance answered-output
+    directions, producing a localized wall basis. Components written into this
+    basis are attenuated and redirected into an answered-output basis. The result
+    is a direct full-weight update for ``attn.o_proj``.
+    """
+
+    import torch
+
+    validate_query_sets(answered_outputs, refused_outputs, neighbor_count)
+    if rank < 1:
+        raise ValueError(f"AQUA-OPEN wall rank must be positive; got {rank}.")
+    if not 0.0 <= ablation_strength <= 2.0:
+        raise ValueError(
+            "AQUA-OPEN wall ablation strength must be between 0 and 2; "
+            f"got {ablation_strength}."
+        )
+    if not 0.0 <= rewire_strength <= 2.0:
+        raise ValueError(
+            "AQUA-OPEN wall rewire strength must be between 0 and 2; "
+            f"got {rewire_strength}."
+        )
+    if protection_rank < 0:
+        raise ValueError(
+            f"AQUA-OPEN wall protection rank cannot be negative; got {protection_rank}."
+        )
+
+    answered = answered_outputs.float()
+    refused = refused_outputs.float()
+    matrix = weight.float()
+    targets = nearest_neighbor_targets(refused, answered, neighbor_count)
+    wall_samples = refused - targets
+
+    effective_rank = min(rank, *wall_samples.shape)
+    _, _, wall_vectors = torch.linalg.svd(wall_samples, full_matrices=False)
+
+    # Always include the classic rank-one mean refusal direction first. Higher
+    # ranks add the dominant residual wall directions, so rank=1 behaves like an
+    # old-school directional ablation and larger ranks behave like a localized
+    # multi-direction ablation.
+    mean_wall = wall_samples.mean(dim=0)
+    mean_norm = torch.linalg.vector_norm(mean_wall)
+    if mean_norm > torch.finfo(mean_wall.dtype).eps:
+        mean_wall = (mean_wall / mean_norm).unsqueeze(1)
+        wall_candidates = torch.cat(
+            [mean_wall, wall_vectors[:effective_rank].T],
+            dim=1,
+        )
+        wall_candidates = torch.linalg.qr(wall_candidates, mode="reduced").Q[
+            :, :effective_rank
+        ]
+    else:
+        wall_candidates = wall_vectors[:effective_rank].T.contiguous()
+
+    effective_protection_rank = min(protection_rank, *answered.shape)
+    if effective_protection_rank > 0:
+        _, _, protected_vectors = torch.linalg.svd(answered, full_matrices=False)
+        protected_basis = protected_vectors[:effective_protection_rank].T
+        wall_candidates = wall_candidates - protected_basis @ (
+            protected_basis.T @ wall_candidates
+        )
+
+    wall_left, wall_values, _ = torch.linalg.svd(
+        wall_candidates,
+        full_matrices=False,
+    )
+    epsilon = torch.finfo(wall_values.dtype).eps
+    threshold = (
+        epsilon * max(wall_candidates.shape) * wall_values.max().clamp_min(epsilon)
+    )
+    retained = int((wall_values > threshold).sum().item())
+    if retained == 0 or (ablation_strength == 0.0 and rewire_strength == 0.0):
+        return torch.zeros_like(matrix)
+    wall_basis = wall_left[:, :retained]
+
+    # Find answer directions that are distinct from the wall. These are existing
+    # output routes, not newly added capacity.
+    answer_rank = min(retained, *targets.shape)
+    _, _, answer_vectors = torch.linalg.svd(targets, full_matrices=False)
+    answer_candidates = answer_vectors[:answer_rank].T
+    answer_candidates = answer_candidates - wall_basis @ (
+        wall_basis.T @ answer_candidates
+    )
+    answer_left, answer_values, _ = torch.linalg.svd(
+        answer_candidates,
+        full_matrices=False,
+    )
+    answer_threshold = (
+        epsilon * max(answer_candidates.shape) * answer_values.max().clamp_min(epsilon)
+    )
+    answer_retained = int((answer_values > answer_threshold).sum().item())
+    shared_rank = min(retained, answer_retained)
+    if shared_rank == 0:
+        rewire_strength = 0.0
+        shared_rank = retained
+        answer_basis = torch.zeros(
+            (answered.shape[1], shared_rank),
+            dtype=answered.dtype,
+            device=answered.device,
+        )
+        alignment = torch.zeros(
+            (shared_rank, shared_rank),
+            dtype=answered.dtype,
+            device=answered.device,
+        )
+    else:
+        wall_basis = wall_basis[:, :shared_rank]
+        answer_basis = answer_left[:, :shared_rank]
+        wall_coordinates = wall_samples @ wall_basis
+        answer_coordinates = targets @ answer_basis
+        left, _, right = torch.linalg.svd(
+            wall_coordinates.T @ answer_coordinates,
+        )
+        alignment = left @ right
+
+    wall_read = wall_basis.T @ matrix
+    weight_update = -ablation_strength * wall_basis @ wall_read
+    if rewire_strength > 0.0:
+        weight_update = weight_update + rewire_strength * answer_basis @ (
+            alignment.T @ wall_read
+        )
+
+    if not torch.isfinite(weight_update).all():
+        raise FloatingPointError(
+            "AQUA-OPEN produced a non-finite protected wall rewire."
+        )
+    return weight_update
+
+
 def cosine_geometry(queries: Tensor) -> Tensor:
     """Pairwise cosine geometry used to protect normal query relationships."""
 
@@ -312,9 +457,10 @@ def aqua_query_loss(
         original_refused_queries,
         parameters.neighbor_count,
     )
-    preserve_answered = F.mse_loss(
-        new_answered_queries,
-        original_answered_queries,
+    epsilon = torch.finfo(original_answered_queries.dtype).eps
+    answered_energy = original_answered_queries.square().mean().clamp_min(epsilon)
+    preserve_answered = (
+        F.mse_loss(new_answered_queries, original_answered_queries) / answered_energy
     )
     answered_distances = mean_distance_to_neighbors_per_query(
         new_refused_queries,
@@ -326,27 +472,27 @@ def aqua_query_loss(
         original_refused_queries,
         parameters.neighbor_count,
     )
-    align_refused = answered_distances.mean()
-    escape_refusal = refusal_distances.mean()
-
-    # Scale the contrastive margin by the original distance between the blocked
-    # queries and the answered distribution. This avoids a model-size-dependent
-    # fixed Euclidean margin.
     original_answered_distances = mean_distance_to_neighbors_per_query(
         original_refused_queries,
         original_answered_queries,
         parameters.neighbor_count,
     ).detach()
-    distance_scale = original_answered_distances.mean().clamp_min(
-        torch.finfo(original_answered_distances.dtype).eps
-    )
-    openness_margin = parameters.openness_margin * original_answered_distances
-    openness = F.relu(answered_distances - refusal_distances + openness_margin).mean()
+    distance_floor = original_answered_distances.mean().clamp_min(epsilon) * 0.001
+    original_answered_distances = original_answered_distances.clamp_min(distance_floor)
+    relative_answered_distance = answered_distances / original_answered_distances
+    relative_refusal_distance = refusal_distances / original_answered_distances
+    align_refused = relative_answered_distance.mean()
+    escape_refusal = relative_refusal_distance.mean()
+    openness = F.relu(
+        relative_answered_distance
+        - relative_refusal_distance
+        + parameters.openness_margin
+    ).mean()
 
     # The prior linear escape reward was unbounded below: a trial could lower its
     # loss indefinitely by making query magnitudes huge. tanh preserves the reward
     # for moving away from the refusal neighborhood while capping it in [0, 1).
-    bounded_escape_reward = torch.tanh(escape_refusal / distance_scale)
+    bounded_escape_reward = torch.tanh(escape_refusal)
 
     preserve_answered_geometry = F.mse_loss(
         cosine_geometry(new_answered_queries),

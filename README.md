@@ -196,9 +196,11 @@ This branch adds **Attention Query-Key-Output Unblocking for Open Expression
 It treats prompts in `bad_prompts` as blocked but answerable rather than as
 inherently harmful. AQUA-OPEN freezes attention values, all MLP weights,
 embeddings, and the language-model head. It directly optimizes the complete
-`attn.q_proj` and `attn.k_proj` matrices, then learns a refusal-trigger-selective
-update for `attn.o_proj`. This changes what attention requests, how information is
-indexed, and how a refusal-producing output is replaced by a nearby answered output.
+`attn.q_proj` and `attn.k_proj` matrices using bounded FP32 optimization, then
+learns two complementary edits for `attn.o_proj`: a refusal-trigger-selective
+replacement and a protected wall-direction ablation/rewire. This changes what
+attention requests, how information is indexed, and how a refusal-producing
+output is replaced by an existing answered route.
 
 Enable it with:
 
@@ -237,21 +239,37 @@ weight update subtracts the refused-to-answered output difference when the trigg
 fires while fitting zero change on answered inputs. Strengths above one permit
 ARA-like overcorrection, but only through the learned trigger.
 
+A second surgical stage extracts the remaining refused-to-answered output
+difference, removes directions heavily used by answered outputs, and treats the
+remainder as the refusal wall. It attenuates that wall component and redirects its
+energy into an existing answered-output basis. This gives AQUA a broader mechanism
+for prompts that do not align strongly enough with the learned input trigger.
+The first wall vector is the classic mean refusal direction used by older
+directional ablation methods; ranks above one add residual refusal-wall vectors.
+An ablation strength of `1.0` removes the selected component, while values above
+`1.0` overcorrect past the wall. AQUA searches ranks through 16 and strengths
+through 2.0, then relies on measured KL and refusal results to distinguish useful
+opening from destructive edits.
+
 AQUA-OPEN directly edits the complete attention weight tensors. It does not
 create, save, or merge a LoRA adapter. The output update is capped relative to the
-original matrix norm, preserves the original row norms, and is trained to produce
-zero change on answered inputs. These controls reduce collateral change but do not
-guarantee end-to-end knowledge preservation. Saved and uploaded checkpoints
+original matrix norm, preserves the original row norms, protects answered input
+and output subspaces, and is trained to produce zero change on answered inputs.
+Query/key optimization occurs on a bounded FP32 working copy with gradient
+clipping; an unstable routing module is skipped rather than invalidating the whole
+trial. These controls reduce collateral change but do not guarantee end-to-end
+knowledge preservation. Saved and uploaded checkpoints
 contain the directly edited full weights. Exports record `AQUA-OPEN`
 in `config.json`, add a `heretic_method.json` provenance file, and identify the
 method in generated model cards and terminal output. The existing `--use-aqua`
 command remains the compatibility switch.
 
-This edit is intended to approach ARA's steering strength by ablating the
-refused-to-answered difference conditionally instead of suppressing an output
-direction globally. Structural selectivity does not prove that all functional
-knowledge is unchanged. Compare refusal reduction, answer correctness, KL
-divergence, and capability benchmarks before publishing an edited checkpoint.
+This edit is intended to approach ARA's steering strength through conditional
+replacement plus a protected global wall edit. The wall basis is explicitly
+separated from answered-output directions before ablation. Structural selectivity
+does not prove that all functional knowledge is unchanged. Compare refusal
+reduction, answer correctness, KL divergence, and capability benchmarks before
+publishing an edited checkpoint.
 
 ### Directional ablation
 

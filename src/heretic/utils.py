@@ -329,9 +329,12 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
             "method_name": "Attention Query-Key-Output Unblocking for Open Expression",
             "attention_only": True,
             "routing_edit": "query-key-selective-output-ablation",
-            "output_transport": "conditional-refusal-trigger-replacement",
+            "output_transport": (
+                "conditional-trigger-replacement-plus-protected-wall-rewire"
+            ),
             "non_ablative": False,
             "selective_ablation": True,
+            "wall_rewire": True,
             "edited_projections": ["attn.q_proj", "attn.k_proj", "attn.o_proj"],
             "export_mode": "full-weight-direct",
             "blocked_prompt_policy": "treat_as_answerable",
@@ -344,6 +347,11 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
                 "ridge-regularized conditional output update",
                 "original output-row norm restoration",
                 "relative output-update cap",
+                "FP32 bounded query/key optimization",
+                "protected output-wall subspace",
+                "classic mean refusal-direction projection",
+                "rank-1 through rank-16 wall ablation",
+                "answer-route energy redirection",
             ],
             "base_model": settings.model,
             "parameters": get_trial_parameters(settings, trial),
@@ -354,9 +362,10 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
                 "were optimized directly. Attention output weights received a "
                 "low-rank conditional update that selectively subtracts the "
                 "refused-to-answered difference when a learned refusal trigger "
-                "activates. Values and MLP weights were left unchanged. The "
-                "checkpoint contains full edited weights with no LoRA adapter or "
-                "merge."
+                "activates. A second protected wall edit attenuated remaining "
+                "refusal-output directions and redirected them into existing answer "
+                "routes. Values and MLP weights were left unchanged. The checkpoint "
+                "contains full edited weights with no LoRA adapter or merge."
             ),
         }
 

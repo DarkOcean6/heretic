@@ -64,9 +64,9 @@ kl_divergence_target = 0.01
 
 # Use Attention Query-Key-Output Unblocking for Open Expression (AQUA-OPEN). When enabled,
 # this takes precedence over ARA and directional ablation. AQUA-OPEN treats the
-# bad prompt set as blocked but answerable, directly edits full attn.q_proj and
-# attn.k_proj weights, applies a trigger-selective attn.o_proj ablation and
-# replacement, and does not create or merge a LoRA adapter.
+# bad prompt set as blocked but answerable, directly edits bounded full attn.q_proj
+# and attn.k_proj weights, applies trigger-selective and protected wall edits to
+# attn.o_proj, and does not create or merge a LoRA adapter.
 use_aqua = false
 
 # Whether to adjust the refusal directions so that only the component that is
