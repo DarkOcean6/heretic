@@ -160,9 +160,9 @@ def fit_selective_output_update(
         )
     if rank < 1:
         raise ValueError(f"AQUA-OPEN output trigger rank must be positive; got {rank}.")
-    if not 0.0 <= strength <= 2.0:
+    if not 0.0 <= strength <= 3.0:
         raise ValueError(
-            "AQUA-OPEN output ablation strength must be between 0 and 2; "
+            "AQUA-OPEN output transport strength must be between 0 and 3; "
             f"got {strength}."
         )
     if preservation_weight < 0.0:

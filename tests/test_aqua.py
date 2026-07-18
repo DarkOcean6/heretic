@@ -160,6 +160,27 @@ class AQUATest(unittest.TestCase):
 
         self.assertLessEqual(torch.linalg.matrix_rank(weight_update).item(), 1)
 
+    def test_selective_output_update_accepts_full_search_strength(self):
+        answered_inputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        answered_outputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        refused_inputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+        refused_outputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+
+        update = fit_selective_output_update(
+            answered_inputs,
+            answered_outputs,
+            refused_inputs,
+            refused_outputs,
+            neighbor_count=1,
+            rank=1,
+            strength=3.0,
+            preservation_weight=1.0,
+            ridge_weight=0.01,
+            protection_rank=0,
+        )
+
+        self.assertTrue(torch.isfinite(update).all())
+
     def test_protected_wall_rewire_ablates_and_redirects(self):
         answered_outputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
         refused_outputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
