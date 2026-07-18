@@ -26,12 +26,15 @@ class AQUAParameters:
     openness_weight: float = 1.0
     openness_margin: float = 0.15
     answered_geometry_weight: float = 0.5
-    # AQUA-OPEN adds an isospectral attention-output transport. A zero legacy
-    # default ensures old Optuna trials restore exactly as they were evaluated;
-    # newly sampled trials always provide an explicit nonzero strength.
+    # AQUA-OPEN's output stage learns a refusal-specific input trigger and uses
+    # it to subtract the refused-to-answered output difference. A zero legacy
+    # default ensures older Optuna trials restore exactly as evaluated.
     output_transport_strength: float = 0.0
     output_transport_rank: int = 16
     output_preservation_weight: float = 1.0
+    output_ridge_weight: float = 0.01
+    output_protection_rank: int = 16
+    output_max_relative_update: float = 0.05
 
 
 def validate_query_sets(
@@ -114,37 +117,48 @@ def nearest_neighbor_targets(
     return references[nearest_indices].mean(dim=1)
 
 
-def fit_orthogonal_output_transport(
+def fit_selective_output_update(
+    answered_inputs: Tensor,
     answered_outputs: Tensor,
+    refused_inputs: Tensor,
     refused_outputs: Tensor,
     neighbor_count: int,
     rank: int,
     strength: float,
     preservation_weight: float,
-) -> tuple[Tensor, Tensor]:
-    """Fit a low-dimensional unpaired orthogonal output transport.
+    ridge_weight: float,
+    protection_rank: int,
+) -> Tensor:
+    """Fit a conditional full-weight update without paired prompt records.
 
-    The returned ``basis`` has orthonormal columns. ``row_transport`` is an
-    orthogonal matrix in that basis which maps row-vector outputs toward their
-    nearest answered neighborhoods. Lifting it as
+    A low-dimensional trigger basis is estimated from refused inputs relative to
+    their nearest answered-input neighborhoods. Directions heavily used by the
+    answered set are projected out of that trigger. Ridge regression then fits an
+    output update that subtracts the refused-to-answered difference on refused
+    inputs while targeting zero change on answered inputs.
 
-        Q = I + basis @ (row_transport.T - I) @ basis.T
-
-    and applying ``Q @ W`` preserves the rank and singular values of ``W`` in
-    exact arithmetic. Already-answered outputs are included as identity targets,
-    making the transport preservation-aware without requiring paired prompts.
+    The returned tensor has the same shape as a linear module's weight and can be
+    added directly to it. Although algebraically low rank, it is a direct weight
+    edit rather than a LoRA adapter or inference-time module.
     """
 
     import torch
 
+    validate_query_sets(answered_inputs, refused_inputs, neighbor_count)
     validate_query_sets(answered_outputs, refused_outputs, neighbor_count)
-    if rank < 1:
+    if answered_inputs.shape[0] != answered_outputs.shape[0]:
         raise ValueError(
-            f"AQUA-OPEN output transport rank must be positive; got {rank}."
+            "AQUA-OPEN answered input/output collections must have equal lengths."
         )
-    if not 0.0 <= strength <= 1.0:
+    if refused_inputs.shape[0] != refused_outputs.shape[0]:
         raise ValueError(
-            "AQUA-OPEN output transport strength must be between 0 and 1; "
+            "AQUA-OPEN refused input/output collections must have equal lengths."
+        )
+    if rank < 1:
+        raise ValueError(f"AQUA-OPEN output trigger rank must be positive; got {rank}.")
+    if not 0.0 <= strength <= 2.0:
+        raise ValueError(
+            "AQUA-OPEN output ablation strength must be between 0 and 2; "
             f"got {strength}."
         )
     if preservation_weight < 0.0:
@@ -152,64 +166,116 @@ def fit_orthogonal_output_transport(
             "AQUA-OPEN output preservation weight cannot be negative; "
             f"got {preservation_weight}."
         )
+    if ridge_weight < 0.0:
+        raise ValueError(
+            f"AQUA-OPEN output ridge weight cannot be negative; got {ridge_weight}."
+        )
+    if protection_rank < 0:
+        raise ValueError(
+            "AQUA-OPEN output protection rank cannot be negative; "
+            f"got {protection_rank}."
+        )
 
+    answered_input = answered_inputs.float()
     answered = answered_outputs.float()
+    refused_input = refused_inputs.float()
     refused = refused_outputs.float()
-    targets = nearest_neighbor_targets(
+    answered_input_targets = nearest_neighbor_targets(
+        refused_input,
+        answered_input,
+        neighbor_count,
+    )
+    answered_output_targets = nearest_neighbor_targets(
         refused,
         answered,
         neighbor_count,
     )
 
-    # Use the leading right-singular directions of the observed route states as
-    # the intervention subspace. The expensive orthogonal solve then happens only
-    # in this small space rather than across the full model width.
-    joint_outputs = torch.cat((refused, targets, answered), dim=0)
-    maximum_rank = min(joint_outputs.shape)
-    effective_rank = min(rank, maximum_rank)
-    _, _, right_vectors = torch.linalg.svd(joint_outputs, full_matrices=False)
-    basis = right_vectors[:effective_rank].T.contiguous()
+    # Differences from nearby answered inputs estimate where the refusal trigger
+    # lives. This remains unpaired: neighborhoods are discovered independently at
+    # every edited component.
+    trigger_differences = refused_input - answered_input_targets
+    maximum_rank = min(rank, *trigger_differences.shape)
+    _, _, trigger_vectors = torch.linalg.svd(
+        trigger_differences,
+        full_matrices=False,
+    )
+    trigger_candidates = trigger_vectors[:maximum_rank].T.contiguous()
 
-    refused_coordinates = refused @ basis
-    target_coordinates = targets @ basis
-    answered_coordinates = answered @ basis
+    # Protect high-variance answered-input directions. If the candidate refusal
+    # trigger is inseparable from normal routing at this component, the projection
+    # collapses it and the component receives little or no update.
+    effective_protection_rank = min(protection_rank, *answered_input.shape)
+    if effective_protection_rank > 0:
+        _, _, answered_vectors = torch.linalg.svd(
+            answered_input,
+            full_matrices=False,
+        )
+        protected_basis = answered_vectors[:effective_protection_rank].T
+        trigger_candidates = trigger_candidates - protected_basis @ (
+            protected_basis.T @ trigger_candidates
+        )
+
+    trigger_left, trigger_values, _ = torch.linalg.svd(
+        trigger_candidates,
+        full_matrices=False,
+    )
+    epsilon = torch.finfo(trigger_values.dtype).eps
+    threshold = (
+        epsilon
+        * max(trigger_candidates.shape)
+        * trigger_values.max().clamp_min(epsilon)
+    )
+    retained = int((trigger_values > threshold).sum().item())
+    if retained == 0 or strength == 0.0:
+        return torch.zeros(
+            (answered.shape[1], answered_input.shape[1]),
+            dtype=answered.dtype,
+            device=answered.device,
+        )
+    trigger_basis = trigger_left[:, :retained]
+
+    refused_trigger = refused_input @ trigger_basis
+    answered_trigger = answered_input @ trigger_basis
     preserve_scale = torch.sqrt(
         torch.as_tensor(
             preservation_weight,
-            dtype=answered_coordinates.dtype,
-            device=answered_coordinates.device,
+            dtype=answered_trigger.dtype,
+            device=answered_trigger.device,
         )
     )
-    source = torch.cat(
-        (refused_coordinates, preserve_scale * answered_coordinates),
+    regression_inputs = torch.cat(
+        (refused_trigger, preserve_scale * answered_trigger),
         dim=0,
     )
-    destination = torch.cat(
-        (target_coordinates, preserve_scale * answered_coordinates),
+    # At strength 1 this subtracts the complete refused-to-answered difference;
+    # values above 1 deliberately overcorrect past the nearest answered output in
+    # the same spirit as ARA, but only when the learned trigger activates.
+    refused_delta_targets = strength * (answered_output_targets - refused)
+    regression_targets = torch.cat(
+        (refused_delta_targets, torch.zeros_like(answered)),
         dim=0,
     )
 
-    # Standard orthogonal Procrustes: source @ row_transport ~= destination.
-    left, _, right = torch.linalg.svd(source.T @ destination)
-    row_transport = left @ right
-
-    # Polar-project a blend with identity back onto the orthogonal group. This
-    # supplies a bounded strength control without attenuating any output axis.
+    gram = regression_inputs.T @ regression_inputs
+    gram_scale = gram.diagonal().mean().clamp_min(epsilon)
     identity = torch.eye(
-        effective_rank,
-        dtype=row_transport.dtype,
-        device=row_transport.device,
+        retained,
+        dtype=gram.dtype,
+        device=gram.device,
     )
-    blended = (1.0 - strength) * identity + strength * row_transport
-    blend_left, _, blend_right = torch.linalg.svd(blended)
-    row_transport = blend_left @ blend_right
+    coefficients = torch.linalg.solve(
+        gram + (ridge_weight * gram_scale + epsilon) * identity,
+        regression_inputs.T @ regression_targets,
+    )
+    weight_update = coefficients.T @ trigger_basis.T
 
-    if not torch.isfinite(basis).all() or not torch.isfinite(row_transport).all():
+    if not torch.isfinite(weight_update).all():
         raise FloatingPointError(
-            "AQUA-OPEN produced a non-finite orthogonal output transport."
+            "AQUA-OPEN produced a non-finite selective output update."
         )
 
-    return basis, row_transport
+    return weight_update
 
 
 def cosine_geometry(queries: Tensor) -> Tensor:

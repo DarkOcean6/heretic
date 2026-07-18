@@ -189,16 +189,16 @@ Silh = Mean silhouette coefficient of residuals for good/bad clusters
 
 ## How Heretic works
 
-### AQUA-OPEN: aggressive, non-ablative attention-route opening
+### AQUA-OPEN: selective attention-wall ablation and route replacement
 
 This branch adds **Attention Query-Key-Output Unblocking for Open Expression
-(AQUA-OPEN)**, an experimental non-ablative edit derived from the `ara` branch.
+(AQUA-OPEN)**, an experimental attention-only edit derived from the `ara` branch.
 It treats prompts in `bad_prompts` as blocked but answerable rather than as
 inherently harmful. AQUA-OPEN freezes attention values, all MLP weights,
 embeddings, and the language-model head. It directly optimizes the complete
-`attn.q_proj` and `attn.k_proj` matrices, then applies a low-dimensional
-orthogonal transport to `attn.o_proj`. This changes what attention requests, how
-information is indexed, and where existing attention results are written.
+`attn.q_proj` and `attn.k_proj` matrices, then learns a refusal-trigger-selective
+update for `attn.o_proj`. This changes what attention requests, how information is
+indexed, and how a refusal-producing output is replaced by a nearby answered output.
 
 Enable it with:
 
@@ -219,7 +219,7 @@ heretic \
   --batch-size 128 \
   --use-aqua \
   --no-use-ara \
-  --study-checkpoint-dir checkpoints-aqua-open \
+  --study-checkpoint-dir checkpoints-aqua-selective \
   --n-trials 200 \
   --n-startup-trials 60
 ```
@@ -230,25 +230,28 @@ query/key states from `bad_prompts` toward their nearest answered-routing
 neighborhoods, pushes them away from their original refusal neighborhoods, and
 applies a scale-aware contrastive margin requiring the edited states to prefer
 answered regions. A full-weight update penalty limits unnecessary movement of
-both routing projections. It then uses unpaired nearest-neighbor targets and a
-standard orthogonal Procrustes solve to rotate attention outputs toward answered
-neighborhoods. The output rotation is low-dimensional and is the identity outside
-its learned route subspace.
+both routing projections. It then estimates a low-dimensional input trigger from
+refused states relative to their nearest answered-input neighborhoods. Directions
+heavily used by answered inputs are projected out. A ridge-regularized direct
+weight update subtracts the refused-to-answered output difference when the trigger
+fires while fitting zero change on answered inputs. Strengths above one permit
+ARA-like overcorrection, but only through the learned trigger.
 
 AQUA-OPEN directly edits the complete attention weight tensors. It does not
-create, save, or merge a LoRA adapter. The orthogonal `attn.o_proj` multiplication
-preserves that matrix's rank and singular values before quantization; this is not
-a guarantee of end-to-end knowledge preservation. Saved and uploaded checkpoints
+create, save, or merge a LoRA adapter. The output update is capped relative to the
+original matrix norm, preserves the original row norms, and is trained to produce
+zero change on answered inputs. These controls reduce collateral change but do not
+guarantee end-to-end knowledge preservation. Saved and uploaded checkpoints
 contain the directly edited full weights. Exports record `AQUA-OPEN`
 in `config.json`, add a `heretic_method.json` provenance file, and identify the
 method in generated model cards and terminal output. The existing `--use-aqua`
 command remains the compatibility switch.
 
-This stronger edit is intended to approach ARA's steering strength without
-projecting an output direction to zero. Structural preservation does not prove
-that all functional knowledge is unchanged. Compare refusal reduction, answer
-correctness, KL divergence, and capability benchmarks before publishing an edited
-checkpoint.
+This edit is intended to approach ARA's steering strength by ablating the
+refused-to-answered difference conditionally instead of suppressing an output
+direction globally. Structural selectivity does not prove that all functional
+knowledge is unchanged. Compare refusal reduction, answer correctness, KL
+divergence, and capability benchmarks before publishing an edited checkpoint.
 
 ### Directional ablation
 

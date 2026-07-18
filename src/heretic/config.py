@@ -204,8 +204,8 @@ class Settings(BaseSettings):
             "Whether to use Attention Query-Key Unblocking for Open Expression "
             "(AQUA-OPEN). AQUA-OPEN takes precedence over ARA and directional "
             "ablation, treats blocked prompts as answerable, and edits attention "
-            "query/key weights directly and applies an orthogonal attention-output "
-            "transport without LoRA."
+            "query/key weights directly and applies a refusal-trigger-selective "
+            "attention-output ablation and replacement without LoRA."
         ),
     )
 

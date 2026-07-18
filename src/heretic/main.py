@@ -570,8 +570,8 @@ def run():
             )
             output_transport_strength = trial.suggest_float(
                 "output_transport_strength",
-                0.03,
-                1.0,
+                0.1,
+                1.5,
                 log=True,
             )
             output_transport_rank = trial.suggest_categorical(
@@ -582,6 +582,22 @@ def run():
                 "output_preservation_weight",
                 0.1,
                 100.0,
+                log=True,
+            )
+            output_ridge_weight = trial.suggest_float(
+                "output_ridge_weight",
+                0.0001,
+                1.0,
+                log=True,
+            )
+            output_protection_rank = trial.suggest_categorical(
+                "output_protection_rank",
+                [4, 8, 16, 32],
+            )
+            output_max_relative_update = trial.suggest_float(
+                "output_max_relative_update",
+                0.005,
+                0.2,
                 log=True,
             )
             update_norm_weight = trial.suggest_float(
@@ -607,6 +623,9 @@ def run():
                 output_transport_strength=output_transport_strength,
                 output_transport_rank=output_transport_rank,
                 output_preservation_weight=output_preservation_weight,
+                output_ridge_weight=output_ridge_weight,
+                output_protection_rank=output_protection_rank,
+                output_max_relative_update=output_max_relative_update,
                 update_norm_weight=update_norm_weight,
                 neighbor_count=neighbor_count,
             )
@@ -735,7 +754,7 @@ def run():
             model.reset_model()
             print(
                 "* Opening attention routes "
-                "(AQUA-OPEN, direct query/key plus orthogonal output routing)..."
+                "(AQUA-OPEN, query/key opening plus selective output ablation)..."
             )
             model.aqua_align_queries(
                 good_module_io,
@@ -947,7 +966,7 @@ def run():
                 model.reset_model()
                 print(
                     "* Opening attention routes "
-                    "(AQUA-OPEN, direct query/key plus orthogonal output routing)..."
+                    "(AQUA-OPEN, query/key opening plus selective output ablation)..."
                 )
                 model.aqua_align_queries(
                     good_module_io,
@@ -1189,7 +1208,8 @@ def run():
                                         [
                                             "aqua-open",
                                             "aqua-qko",
-                                            "orthogonal-transport",
+                                            "selective-ablation",
+                                            "conditional-route-replacement",
                                         ]
                                     )
                                     card.data.tags.append("attention-only")

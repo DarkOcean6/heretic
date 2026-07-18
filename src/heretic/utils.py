@@ -328,9 +328,10 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
             "method": "AQUA-OPEN",
             "method_name": "Attention Query-Key-Output Unblocking for Open Expression",
             "attention_only": True,
-            "routing_edit": "query-key-output-orthogonal",
-            "output_transport": "low-rank-orthogonal-procrustes",
-            "non_ablative": True,
+            "routing_edit": "query-key-selective-output-ablation",
+            "output_transport": "conditional-refusal-trigger-replacement",
+            "non_ablative": False,
+            "selective_ablation": True,
             "edited_projections": ["attn.q_proj", "attn.k_proj", "attn.o_proj"],
             "export_mode": "full-weight-direct",
             "blocked_prompt_policy": "treat_as_answerable",
@@ -338,8 +339,11 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
                 "answered-query reconstruction",
                 "answered-query cosine geometry",
                 "full-weight update penalty",
-                "orthogonal output transport",
-                "answered-output identity targets",
+                "answered-input protected trigger subspace",
+                "zero-change answered-output targets",
+                "ridge-regularized conditional output update",
+                "original output-row norm restoration",
+                "relative output-update cap",
             ],
             "base_model": settings.model,
             "parameters": get_trial_parameters(settings, trial),
@@ -347,10 +351,12 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
                 "This model was edited with Heretic's AQUA-OPEN method. Blocked "
                 "prompts were treated as answerable and their attention routes were "
                 "opened toward answered-routing neighborhoods. Query and key weights "
-                "were optimized directly, and attention output weights received a "
-                "low-dimensional orthogonal transport. Values and MLP weights were "
-                "left unchanged. The checkpoint contains full edited weights with no "
-                "LoRA adapter or merge."
+                "were optimized directly. Attention output weights received a "
+                "low-rank conditional update that selectively subtracts the "
+                "refused-to-answered difference when a learned refusal trigger "
+                "activates. Values and MLP weights were left unchanged. The "
+                "checkpoint contains full edited weights with no LoRA adapter or "
+                "merge."
             ),
         }
 

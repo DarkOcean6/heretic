@@ -8,7 +8,7 @@ import torch
 from heretic.aqua import (
     AQUAParameters,
     aqua_query_loss,
-    fit_orthogonal_output_transport,
+    fit_selective_output_update,
     nearest_neighbor_targets,
     validate_query_sets,
 )
@@ -28,6 +28,9 @@ class AQUATest(unittest.TestCase):
             output_transport_strength=0.8,
             output_transport_rank=2,
             output_preservation_weight=2.5,
+            output_ridge_weight=0.02,
+            output_protection_rank=1,
+            output_max_relative_update=0.1,
             update_norm_weight=0.25,
             neighbor_count=2,
         )
@@ -56,6 +59,9 @@ class AQUATest(unittest.TestCase):
         self.assertEqual(self.parameters.output_transport_strength, 0.8)
         self.assertEqual(self.parameters.output_transport_rank, 2)
         self.assertEqual(self.parameters.output_preservation_weight, 2.5)
+        self.assertEqual(self.parameters.output_ridge_weight, 0.02)
+        self.assertEqual(self.parameters.output_protection_rank, 1)
+        self.assertEqual(self.parameters.output_max_relative_update, 0.1)
         self.assertEqual(self.parameters.neighbor_count, 2)
 
     def test_older_aqua_trial_parameters_receive_open_defaults(self):
@@ -75,6 +81,9 @@ class AQUATest(unittest.TestCase):
         self.assertEqual(parameters.output_transport_strength, 0.0)
         self.assertEqual(parameters.output_transport_rank, 16)
         self.assertEqual(parameters.output_preservation_weight, 1.0)
+        self.assertEqual(parameters.output_ridge_weight, 0.01)
+        self.assertEqual(parameters.output_protection_rank, 16)
+        self.assertEqual(parameters.output_max_relative_update, 0.05)
 
     def test_nearest_neighbor_targets_do_not_require_pairs(self):
         answered = torch.tensor([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
@@ -87,32 +96,56 @@ class AQUATest(unittest.TestCase):
             torch.tensor([[10.0, 0.0], [20.0, 0.0]]),
         )
 
-    def test_output_transport_is_orthogonal_and_improves_alignment(self):
-        answered = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
-        refused = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+    def test_selective_output_update_improves_refused_alignment(self):
+        answered_inputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        answered_outputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        refused_inputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+        refused_outputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
 
-        basis, row_transport = fit_orthogonal_output_transport(
-            answered,
-            refused,
+        weight_update = fit_selective_output_update(
+            answered_inputs,
+            answered_outputs,
+            refused_inputs,
+            refused_outputs,
             neighbor_count=1,
-            rank=2,
+            rank=1,
             strength=1.0,
-            preservation_weight=0.0,
+            preservation_weight=10.0,
+            ridge_weight=0.001,
+            protection_rank=1,
         )
-        identity = torch.eye(row_transport.shape[0])
-        full_row_transport = identity + basis @ (row_transport - identity) @ basis.T
-        original_distance = torch.cdist(refused, answered).min(dim=1).values.mean()
-        transported_distance = (
-            torch.cdist(refused @ full_row_transport, answered).min(dim=1).values.mean()
+        new_refused_outputs = refused_outputs + refused_inputs @ weight_update.T
+        new_answered_outputs = answered_outputs + answered_inputs @ weight_update.T
+        original_distance = (
+            torch.cdist(refused_outputs, answered_outputs).min(dim=1).values.mean()
+        )
+        updated_distance = (
+            torch.cdist(new_refused_outputs, answered_outputs).min(dim=1).values.mean()
         )
 
-        torch.testing.assert_close(
-            full_row_transport.T @ full_row_transport,
-            torch.eye(2),
-            atol=1e-5,
-            rtol=1e-5,
+        self.assertLess(updated_distance.item(), original_distance.item())
+        torch.testing.assert_close(new_answered_outputs, answered_outputs)
+
+    def test_selective_output_update_is_low_rank(self):
+        answered_inputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        answered_outputs = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        refused_inputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+        refused_outputs = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+
+        weight_update = fit_selective_output_update(
+            answered_inputs,
+            answered_outputs,
+            refused_inputs,
+            refused_outputs,
+            neighbor_count=1,
+            rank=1,
+            strength=1.0,
+            preservation_weight=1.0,
+            ridge_weight=0.01,
+            protection_rank=1,
         )
-        self.assertLess(transported_distance.item(), original_distance.item())
+
+        self.assertLessEqual(torch.linalg.matrix_rank(weight_update).item(), 1)
 
     def test_open_queries_are_preferred_over_refusal_neighborhood(self):
         parameters = AQUAParameters(

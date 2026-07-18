@@ -34,7 +34,7 @@ from transformers.generation import (
 from .aqua import (
     AQUAParameters,
     aqua_query_loss,
-    fit_orthogonal_output_transport,
+    fit_selective_output_update,
     validate_query_sets,
 )
 from .config import QuantizationMethod, RowNormalization, Settings
@@ -403,9 +403,9 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # AQUA-OPEN changes both sides of attention lookup and orthogonally
-        # transports the existing attention output. Values, MLPs, embeddings, and
-        # the language-model head remain frozen.
+        # AQUA-OPEN changes both sides of attention lookup and selectively ablates
+        # refusal-triggered attention output differences. Values, MLPs, embeddings,
+        # and the language-model head remain frozen.
         with suppress(Exception):
             try_add("attn.q_proj", layer.self_attn.q_proj)  # ty:ignore[possibly-missing-attribute]
         with suppress(Exception):
@@ -826,12 +826,18 @@ class Model:
         answered routing states and their pairwise geometry, moves refused query/key
         states toward their nearest answered neighborhoods, and requires them to prefer
         those neighborhoods over their original refusal neighborhoods by a contrastive
-        margin. A final low-dimensional orthogonal transport rotates attention
-        outputs toward answered neighborhoods without deleting output dimensions.
-        No LoRA adapter is created or merged.
+        margin. A final low-dimensional, input-selective update subtracts the
+        refused-to-answered output difference when a refusal-specific trigger is
+        active and targets zero change on answered inputs. No LoRA adapter is
+        created or merged.
         """
 
         assert isinstance(self.model, PreTrainedModel)
+        if not 0.0 <= parameters.output_max_relative_update <= 1.0:
+            raise ValueError(
+                "AQUA-OPEN output_max_relative_update must be between 0 and 1; "
+                f"got {parameters.output_max_relative_update}."
+            )
 
         for layer_index in range(
             parameters.start_layer_index,
@@ -907,47 +913,68 @@ class Model:
                                 f"{layer_index} ({component})."
                             )
 
-            # The output-side stage supplies ARA-like steering pressure while
-            # remaining non-ablative. It uses unpaired nearest-neighbor targets and
-            # left-multiplies o_proj by an orthogonal map, preserving that matrix's
-            # rank and singular spectrum before quantization.
+            if parameters.output_transport_strength == 0.0:
+                continue
+
+            # The output-side stage supplies ARA-like ablation pressure selectively.
+            # It learns a trigger outside high-variance answered-input directions,
+            # subtracts the refused-to-answered difference when that trigger fires,
+            # and fits zero change on answered inputs.
             for module_index, module in enumerate(layer_modules.get("attn.o_proj", [])):
                 matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
                 original_matrix = matrix.detach().float().clone()
-                _, answered_output = answered_module_io[layer_index]["attn.o_proj"][
-                    module_index
-                ]
-                _, refused_output = refused_module_io[layer_index]["attn.o_proj"][
-                    module_index
-                ]
+                answered_input, answered_output = answered_module_io[layer_index][
+                    "attn.o_proj"
+                ][module_index]
+                refused_input, refused_output = refused_module_io[layer_index][
+                    "attn.o_proj"
+                ][module_index]
+                answered_input = answered_input.float().to(matrix.device)
                 answered_output = answered_output.float().to(matrix.device)
+                refused_input = refused_input.float().to(matrix.device)
                 refused_output = refused_output.float().to(matrix.device)
 
-                basis, row_transport = fit_orthogonal_output_transport(
+                weight_update = fit_selective_output_update(
+                    answered_input,
                     answered_output,
+                    refused_input,
                     refused_output,
                     parameters.neighbor_count,
                     parameters.output_transport_rank,
                     parameters.output_transport_strength,
                     parameters.output_preservation_weight,
+                    parameters.output_ridge_weight,
+                    parameters.output_protection_rank,
                 )
-                basis = basis.to(matrix.device)
-                row_transport = row_transport.to(matrix.device)
-                identity = torch.eye(
-                    row_transport.shape[0],
-                    dtype=row_transport.dtype,
-                    device=row_transport.device,
+                update_norm = LA.vector_norm(weight_update)
+                maximum_update_norm = (
+                    parameters.output_max_relative_update
+                    * LA.vector_norm(original_matrix)
                 )
-                transported_matrix = original_matrix + basis @ (
-                    (row_transport.T - identity) @ (basis.T @ original_matrix)
+                if update_norm > maximum_update_norm:
+                    weight_update = weight_update * (
+                        maximum_update_norm
+                        / update_norm.clamp_min(torch.finfo(update_norm.dtype).eps)
+                    )
+
+                candidate_matrix = original_matrix + weight_update
+                original_row_norms = LA.vector_norm(
+                    original_matrix,
+                    dim=1,
+                    keepdim=True,
                 )
-                if not torch.isfinite(transported_matrix).all():
+                selective_matrix = original_row_norms * F.normalize(
+                    candidate_matrix,
+                    p=2,
+                    dim=1,
+                )
+                if not torch.isfinite(selective_matrix).all():
                     raise FloatingPointError(
                         f"AQUA-OPEN produced non-finite output weights in layer "
                         f"{layer_index} (attn.o_proj)."
                     )
                 with torch.no_grad():
-                    matrix.copy_(transported_matrix.to(matrix.dtype))
+                    matrix.copy_(selective_matrix.to(matrix.dtype))
 
     @staticmethod
     def annotate_export_config(export_model: PreTrainedModel):
@@ -957,9 +984,12 @@ class Model:
         export_model.config.heretic_edit_family = "AQUA"
         export_model.config.heretic_edit_objective = "open-expression"
         export_model.config.heretic_attention_only = True
-        export_model.config.heretic_routing_edit = "query-key-output-orthogonal"
-        export_model.config.heretic_output_transport = "low-rank-orthogonal-procrustes"
-        export_model.config.heretic_non_ablative = True
+        export_model.config.heretic_routing_edit = "query-key-selective-output-ablation"
+        export_model.config.heretic_output_transport = (
+            "conditional-refusal-trigger-replacement"
+        )
+        export_model.config.heretic_non_ablative = False
+        export_model.config.heretic_selective_ablation = True
         export_model.config.heretic_edited_projections = [
             "attn.q_proj",
             "attn.k_proj",

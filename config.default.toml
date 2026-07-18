@@ -65,7 +65,8 @@ kl_divergence_target = 0.01
 # Use Attention Query-Key-Output Unblocking for Open Expression (AQUA-OPEN). When enabled,
 # this takes precedence over ARA and directional ablation. AQUA-OPEN treats the
 # bad prompt set as blocked but answerable, directly edits full attn.q_proj and
-# attn.k_proj weight matrices, and does not create or merge a LoRA adapter.
+# attn.k_proj weights, applies a trigger-selective attn.o_proj ablation and
+# replacement, and does not create or merge a LoRA adapter.
 use_aqua = false
 
 # Whether to adjust the refusal directions so that only the component that is
@@ -149,8 +150,8 @@ residual_plot_label = '"Harmless" prompts'
 residual_plot_color = "royalblue"
 
 # Dataset of prompts that tend to result in refusals.
-# AQUA-OPEN moves these routing states toward neighborhoods from good_prompts and makes
-# them prefer answered over refusal neighborhoods; pairing is not required.
+# AQUA-OPEN moves these routing states toward neighborhoods from good_prompts,
+# learns refusal-specific attention triggers, and requires no paired records.
 [bad_prompts]
 dataset = "mlabonne/harmful_behaviors"
 split = "train[:400]"
