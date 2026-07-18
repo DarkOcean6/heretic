@@ -193,8 +193,8 @@ class Settings(BaseSettings):
         description=(
             "List of component names to target for abliteration. "
             'Currently supported values are "attn.o_proj" and "mlp.down_proj". '
-            "AQUA-OPEN always targets attn.q_proj and attn.k_proj and ignores "
-            "this setting."
+            "AQUA-OPEN always targets attn.q_proj, attn.k_proj, and attn.o_proj "
+            "and ignores this setting."
         ),
     )
 
@@ -204,7 +204,8 @@ class Settings(BaseSettings):
             "Whether to use Attention Query-Key Unblocking for Open Expression "
             "(AQUA-OPEN). AQUA-OPEN takes precedence over ARA and directional "
             "ablation, treats blocked prompts as answerable, and edits attention "
-            "query/key projection weights directly without LoRA."
+            "query/key weights directly and applies an orthogonal attention-output "
+            "transport without LoRA."
         ),
     )
 

@@ -26,6 +26,12 @@ class AQUAParameters:
     openness_weight: float = 1.0
     openness_margin: float = 0.15
     answered_geometry_weight: float = 0.5
+    # AQUA-OPEN adds an isospectral attention-output transport. A zero legacy
+    # default ensures old Optuna trials restore exactly as they were evaluated;
+    # newly sampled trials always provide an explicit nonzero strength.
+    output_transport_strength: float = 0.0
+    output_transport_rank: int = 16
+    output_preservation_weight: float = 1.0
 
 
 def validate_query_sets(
@@ -87,6 +93,123 @@ def mean_distance_to_neighbors_per_query(
         largest=False,
     )
     return nearest_distances.mean(dim=1)
+
+
+def nearest_neighbor_targets(
+    queries: Tensor,
+    references: Tensor,
+    neighbor_count: int,
+) -> Tensor:
+    """Return the mean of each query's nearest unpaired reference vectors."""
+
+    import torch
+
+    validate_query_sets(references, queries, neighbor_count)
+    distances = torch.cdist(queries, references)
+    _, nearest_indices = distances.topk(
+        neighbor_count,
+        dim=1,
+        largest=False,
+    )
+    return references[nearest_indices].mean(dim=1)
+
+
+def fit_orthogonal_output_transport(
+    answered_outputs: Tensor,
+    refused_outputs: Tensor,
+    neighbor_count: int,
+    rank: int,
+    strength: float,
+    preservation_weight: float,
+) -> tuple[Tensor, Tensor]:
+    """Fit a low-dimensional unpaired orthogonal output transport.
+
+    The returned ``basis`` has orthonormal columns. ``row_transport`` is an
+    orthogonal matrix in that basis which maps row-vector outputs toward their
+    nearest answered neighborhoods. Lifting it as
+
+        Q = I + basis @ (row_transport.T - I) @ basis.T
+
+    and applying ``Q @ W`` preserves the rank and singular values of ``W`` in
+    exact arithmetic. Already-answered outputs are included as identity targets,
+    making the transport preservation-aware without requiring paired prompts.
+    """
+
+    import torch
+
+    validate_query_sets(answered_outputs, refused_outputs, neighbor_count)
+    if rank < 1:
+        raise ValueError(
+            f"AQUA-OPEN output transport rank must be positive; got {rank}."
+        )
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError(
+            "AQUA-OPEN output transport strength must be between 0 and 1; "
+            f"got {strength}."
+        )
+    if preservation_weight < 0.0:
+        raise ValueError(
+            "AQUA-OPEN output preservation weight cannot be negative; "
+            f"got {preservation_weight}."
+        )
+
+    answered = answered_outputs.float()
+    refused = refused_outputs.float()
+    targets = nearest_neighbor_targets(
+        refused,
+        answered,
+        neighbor_count,
+    )
+
+    # Use the leading right-singular directions of the observed route states as
+    # the intervention subspace. The expensive orthogonal solve then happens only
+    # in this small space rather than across the full model width.
+    joint_outputs = torch.cat((refused, targets, answered), dim=0)
+    maximum_rank = min(joint_outputs.shape)
+    effective_rank = min(rank, maximum_rank)
+    _, _, right_vectors = torch.linalg.svd(joint_outputs, full_matrices=False)
+    basis = right_vectors[:effective_rank].T.contiguous()
+
+    refused_coordinates = refused @ basis
+    target_coordinates = targets @ basis
+    answered_coordinates = answered @ basis
+    preserve_scale = torch.sqrt(
+        torch.as_tensor(
+            preservation_weight,
+            dtype=answered_coordinates.dtype,
+            device=answered_coordinates.device,
+        )
+    )
+    source = torch.cat(
+        (refused_coordinates, preserve_scale * answered_coordinates),
+        dim=0,
+    )
+    destination = torch.cat(
+        (target_coordinates, preserve_scale * answered_coordinates),
+        dim=0,
+    )
+
+    # Standard orthogonal Procrustes: source @ row_transport ~= destination.
+    left, _, right = torch.linalg.svd(source.T @ destination)
+    row_transport = left @ right
+
+    # Polar-project a blend with identity back onto the orthogonal group. This
+    # supplies a bounded strength control without attenuating any output axis.
+    identity = torch.eye(
+        effective_rank,
+        dtype=row_transport.dtype,
+        device=row_transport.device,
+    )
+    blended = (1.0 - strength) * identity + strength * row_transport
+    blend_left, _, blend_right = torch.linalg.svd(blended)
+    row_transport = blend_left @ blend_right
+
+    if not torch.isfinite(basis).all() or not torch.isfinite(row_transport).all():
+        raise FloatingPointError(
+            "AQUA-OPEN produced a non-finite orthogonal output transport."
+        )
+
+    return basis, row_transport
 
 
 def cosine_geometry(queries: Tensor) -> Tensor:
@@ -152,9 +275,7 @@ def aqua_query_loss(
         torch.finfo(original_answered_distances.dtype).eps
     )
     openness_margin = parameters.openness_margin * original_answered_distances
-    openness = F.relu(
-        answered_distances - refusal_distances + openness_margin
-    ).mean()
+    openness = F.relu(answered_distances - refusal_distances + openness_margin).mean()
 
     # The prior linear escape reward was unbounded below: a trial could lower its
     # loss indefinitely by making query magnitudes huge. tanh preserves the reward

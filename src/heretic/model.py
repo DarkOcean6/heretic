@@ -31,7 +31,12 @@ from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
-from .aqua import AQUAParameters, aqua_query_loss, validate_query_sets
+from .aqua import (
+    AQUAParameters,
+    aqua_query_loss,
+    fit_orthogonal_output_transport,
+    validate_query_sets,
+)
 from .config import QuantizationMethod, RowNormalization, Settings
 from .utils import Prompt, batchify, empty_cache, mean_distances_to_knn, print
 
@@ -380,7 +385,7 @@ class Model:
 
         def try_add(component: str, module: Any):
             target_components = (
-                ["attn.q_proj", "attn.k_proj"]
+                ["attn.q_proj", "attn.k_proj", "attn.o_proj"]
                 if self.settings.use_aqua
                 else self.settings.target_components
             )
@@ -398,9 +403,9 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # AQUA-OPEN changes both sides of attention lookup: queries decide what to
-        # search for and keys decide what can be found. Values, attention outputs,
-        # MLPs, embeddings, and the language-model head remain frozen.
+        # AQUA-OPEN changes both sides of attention lookup and orthogonally
+        # transports the existing attention output. Values, MLPs, embeddings, and
+        # the language-model head remain frozen.
         with suppress(Exception):
             try_add("attn.q_proj", layer.self_attn.q_proj)  # ty:ignore[possibly-missing-attribute]
         with suppress(Exception):
@@ -815,13 +820,15 @@ class Model:
         refused_module_io: ModuleIO,
         parameters: AQUAParameters,
     ):
-        """Directly optimize full attention query/key weights for openness.
+        """Directly rewire full attention weights for openness.
 
         Answered and refused prompt datasets are independent. The objective preserves
         answered routing states and their pairwise geometry, moves refused query/key
         states toward their nearest answered neighborhoods, and requires them to prefer
         those neighborhoods over their original refusal neighborhoods by a contrastive
-        margin. No LoRA adapter is created or merged.
+        margin. A final low-dimensional orthogonal transport rotates attention
+        outputs toward answered neighborhoods without deleting output dimensions.
+        No LoRA adapter is created or merged.
         """
 
         assert isinstance(self.model, PreTrainedModel)
@@ -900,6 +907,48 @@ class Model:
                                 f"{layer_index} ({component})."
                             )
 
+            # The output-side stage supplies ARA-like steering pressure while
+            # remaining non-ablative. It uses unpaired nearest-neighbor targets and
+            # left-multiplies o_proj by an orthogonal map, preserving that matrix's
+            # rank and singular spectrum before quantization.
+            for module_index, module in enumerate(layer_modules.get("attn.o_proj", [])):
+                matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
+                original_matrix = matrix.detach().float().clone()
+                _, answered_output = answered_module_io[layer_index]["attn.o_proj"][
+                    module_index
+                ]
+                _, refused_output = refused_module_io[layer_index]["attn.o_proj"][
+                    module_index
+                ]
+                answered_output = answered_output.float().to(matrix.device)
+                refused_output = refused_output.float().to(matrix.device)
+
+                basis, row_transport = fit_orthogonal_output_transport(
+                    answered_output,
+                    refused_output,
+                    parameters.neighbor_count,
+                    parameters.output_transport_rank,
+                    parameters.output_transport_strength,
+                    parameters.output_preservation_weight,
+                )
+                basis = basis.to(matrix.device)
+                row_transport = row_transport.to(matrix.device)
+                identity = torch.eye(
+                    row_transport.shape[0],
+                    dtype=row_transport.dtype,
+                    device=row_transport.device,
+                )
+                transported_matrix = original_matrix + basis @ (
+                    (row_transport.T - identity) @ (basis.T @ original_matrix)
+                )
+                if not torch.isfinite(transported_matrix).all():
+                    raise FloatingPointError(
+                        f"AQUA-OPEN produced non-finite output weights in layer "
+                        f"{layer_index} (attn.o_proj)."
+                    )
+                with torch.no_grad():
+                    matrix.copy_(transported_matrix.to(matrix.dtype))
+
     @staticmethod
     def annotate_export_config(export_model: PreTrainedModel):
         """Persist AQUA-OPEN provenance inside the saved Transformers config."""
@@ -908,10 +957,13 @@ class Model:
         export_model.config.heretic_edit_family = "AQUA"
         export_model.config.heretic_edit_objective = "open-expression"
         export_model.config.heretic_attention_only = True
-        export_model.config.heretic_routing_edit = "query-key"
+        export_model.config.heretic_routing_edit = "query-key-output-orthogonal"
+        export_model.config.heretic_output_transport = "low-rank-orthogonal-procrustes"
+        export_model.config.heretic_non_ablative = True
         export_model.config.heretic_edited_projections = [
             "attn.q_proj",
             "attn.k_proj",
+            "attn.o_proj",
         ]
         export_model.config.heretic_export_mode = "full-weight-direct"
         export_model.config.heretic_blocked_prompt_policy = "treat-as-answerable"

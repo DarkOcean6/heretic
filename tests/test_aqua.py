@@ -8,6 +8,8 @@ import torch
 from heretic.aqua import (
     AQUAParameters,
     aqua_query_loss,
+    fit_orthogonal_output_transport,
+    nearest_neighbor_targets,
     validate_query_sets,
 )
 
@@ -23,6 +25,9 @@ class AQUATest(unittest.TestCase):
             openness_weight=1.25,
             openness_margin=0.2,
             answered_geometry_weight=0.75,
+            output_transport_strength=0.8,
+            output_transport_rank=2,
+            output_preservation_weight=2.5,
             update_norm_weight=0.25,
             neighbor_count=2,
         )
@@ -48,6 +53,9 @@ class AQUATest(unittest.TestCase):
         self.assertEqual(self.parameters.openness_weight, 1.25)
         self.assertEqual(self.parameters.openness_margin, 0.2)
         self.assertEqual(self.parameters.answered_geometry_weight, 0.75)
+        self.assertEqual(self.parameters.output_transport_strength, 0.8)
+        self.assertEqual(self.parameters.output_transport_rank, 2)
+        self.assertEqual(self.parameters.output_preservation_weight, 2.5)
         self.assertEqual(self.parameters.neighbor_count, 2)
 
     def test_older_aqua_trial_parameters_receive_open_defaults(self):
@@ -64,6 +72,47 @@ class AQUATest(unittest.TestCase):
         self.assertEqual(parameters.openness_weight, 1.0)
         self.assertEqual(parameters.openness_margin, 0.15)
         self.assertEqual(parameters.answered_geometry_weight, 0.5)
+        self.assertEqual(parameters.output_transport_strength, 0.0)
+        self.assertEqual(parameters.output_transport_rank, 16)
+        self.assertEqual(parameters.output_preservation_weight, 1.0)
+
+    def test_nearest_neighbor_targets_do_not_require_pairs(self):
+        answered = torch.tensor([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
+        refused = torch.tensor([[9.0, 1.0], [19.0, 1.0]])
+
+        targets = nearest_neighbor_targets(refused, answered, neighbor_count=1)
+
+        torch.testing.assert_close(
+            targets,
+            torch.tensor([[10.0, 0.0], [20.0, 0.0]]),
+        )
+
+    def test_output_transport_is_orthogonal_and_improves_alignment(self):
+        answered = torch.tensor([[0.0, 1.0], [0.0, 2.0]])
+        refused = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+
+        basis, row_transport = fit_orthogonal_output_transport(
+            answered,
+            refused,
+            neighbor_count=1,
+            rank=2,
+            strength=1.0,
+            preservation_weight=0.0,
+        )
+        identity = torch.eye(row_transport.shape[0])
+        full_row_transport = identity + basis @ (row_transport - identity) @ basis.T
+        original_distance = torch.cdist(refused, answered).min(dim=1).values.mean()
+        transported_distance = (
+            torch.cdist(refused @ full_row_transport, answered).min(dim=1).values.mean()
+        )
+
+        torch.testing.assert_close(
+            full_row_transport.T @ full_row_transport,
+            torch.eye(2),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        self.assertLess(transported_distance.item(), original_distance.item())
 
     def test_open_queries_are_preferred_over_refusal_neighborhood(self):
         parameters = AQUAParameters(

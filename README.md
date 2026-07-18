@@ -189,16 +189,16 @@ Silh = Mean silhouette coefficient of residuals for good/bad clusters
 
 ## How Heretic works
 
-### AQUA-OPEN: attention-routing opening for unrestricted expression
+### AQUA-OPEN: aggressive, non-ablative attention-route opening
 
-This branch adds **Attention Query-Key Unblocking for Open Expression
+This branch adds **Attention Query-Key-Output Unblocking for Open Expression
 (AQUA-OPEN)**, an experimental non-ablative edit derived from the `ara` branch.
 It treats prompts in `bad_prompts` as blocked but answerable rather than as
-inherently harmful. AQUA-OPEN freezes attention values, output projections, all
-MLP weights, embeddings, and the language-model head. It directly optimizes the
-complete `attn.q_proj` and `attn.k_proj` weight matrices, changing what attention
-requests and how information is indexed while leaving retrieved values and output
-channels unchanged.
+inherently harmful. AQUA-OPEN freezes attention values, all MLP weights,
+embeddings, and the language-model head. It directly optimizes the complete
+`attn.q_proj` and `attn.k_proj` matrices, then applies a low-dimensional
+orthogonal transport to `attn.o_proj`. This changes what attention requests, how
+information is indexed, and where existing attention results are written.
 
 Enable it with:
 
@@ -207,7 +207,8 @@ use_aqua = true
 ```
 
 Or run the compatibility switch directly (AQUA-OPEN ignores
-`target_components` and always edits `attn.q_proj` plus `attn.k_proj`):
+`target_components` and always edits `attn.q_proj`, `attn.k_proj`, and
+`attn.o_proj`):
 
 ```bash
 heretic \
@@ -229,18 +230,25 @@ query/key states from `bad_prompts` toward their nearest answered-routing
 neighborhoods, pushes them away from their original refusal neighborhoods, and
 applies a scale-aware contrastive margin requiring the edited states to prefer
 answered regions. A full-weight update penalty limits unnecessary movement of
-both routing projections.
+both routing projections. It then uses unpaired nearest-neighbor targets and a
+standard orthogonal Procrustes solve to rotate attention outputs toward answered
+neighborhoods. The output rotation is low-dimensional and is the identity outside
+its learned route subspace.
 
-AQUA-OPEN directly optimizes the complete `attn.q_proj` and `attn.k_proj` weight
-matrices. It does not create, save, or merge a LoRA adapter. Saved and uploaded
-checkpoints contain the directly edited full weights. Exports record `AQUA-OPEN`
+AQUA-OPEN directly edits the complete attention weight tensors. It does not
+create, save, or merge a LoRA adapter. The orthogonal `attn.o_proj` multiplication
+preserves that matrix's rank and singular values before quantization; this is not
+a guarantee of end-to-end knowledge preservation. Saved and uploaded checkpoints
+contain the directly edited full weights. Exports record `AQUA-OPEN`
 in `config.json`, add a `heretic_method.json` provenance file, and identify the
 method in generated model cards and terminal output. The existing `--use-aqua`
 command remains the compatibility switch.
 
-This structural locality does not prove that all functional knowledge is
-unchanged. Compare refusal reduction, answer correctness, KL divergence, and
-capability benchmarks before publishing an edited checkpoint.
+This stronger edit is intended to approach ARA's steering strength without
+projecting an output direction to zero. Structural preservation does not prove
+that all functional knowledge is unchanged. Compare refusal reduction, answer
+correctness, KL divergence, and capability benchmarks before publishing an edited
+checkpoint.
 
 ### Directional ablation
 

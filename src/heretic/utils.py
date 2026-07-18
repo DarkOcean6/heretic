@@ -299,8 +299,8 @@ def get_trial_parameters(settings: Settings, trial: Trial) -> dict[str, str]:
 def get_method_description(settings: Settings) -> str:
     if settings.use_aqua:
         return (
-            " with the attention-only **Attention Query-Key Unblocking for Open "
-            "Expression (AQUA-OPEN)** method"
+            " with the attention-only **Attention Query-Key-Output Unblocking for "
+            "Open Expression (AQUA-OPEN)** method"
         )
     elif settings.use_ara:
         return (
@@ -326,26 +326,31 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
     if settings.use_aqua:
         return {
             "method": "AQUA-OPEN",
-            "method_name": "Attention Query-Key Unblocking for Open Expression",
+            "method_name": "Attention Query-Key-Output Unblocking for Open Expression",
             "attention_only": True,
-            "routing_edit": "query-key",
-            "edited_projections": ["attn.q_proj", "attn.k_proj"],
+            "routing_edit": "query-key-output-orthogonal",
+            "output_transport": "low-rank-orthogonal-procrustes",
+            "non_ablative": True,
+            "edited_projections": ["attn.q_proj", "attn.k_proj", "attn.o_proj"],
             "export_mode": "full-weight-direct",
             "blocked_prompt_policy": "treat_as_answerable",
             "preservation_controls": [
                 "answered-query reconstruction",
                 "answered-query cosine geometry",
                 "full-weight update penalty",
+                "orthogonal output transport",
+                "answered-output identity targets",
             ],
             "base_model": settings.model,
             "parameters": get_trial_parameters(settings, trial),
             "note": (
                 "This model was edited with Heretic's AQUA-OPEN method. Blocked "
-                "prompts were treated as answerable and their attention queries were "
-                "opened toward answered-routing neighborhoods. Only attention query "
-                "and key projections were optimized directly; values, output "
-                "projections, and MLP weights were left unchanged. The checkpoint "
-                "contains full edited weights with no LoRA adapter or merge."
+                "prompts were treated as answerable and their attention routes were "
+                "opened toward answered-routing neighborhoods. Query and key weights "
+                "were optimized directly, and attention output weights received a "
+                "low-dimensional orthogonal transport. Values and MLP weights were "
+                "left unchanged. The checkpoint contains full edited weights with no "
+                "LoRA adapter or merge."
             ),
         }
 
@@ -389,7 +394,7 @@ def get_readme_intro(
         get_method_description(settings)
     }
 
-## Abliteration parameters
+## {"AQUA parameters" if settings.use_aqua else "Abliteration parameters"}
 
 | Parameter | Value |
 | :-------- | :---: |
@@ -417,3 +422,33 @@ def get_readme_intro(
 -----
 
 """
+
+
+def write_export_readme(
+    save_directory: str | Path,
+    settings: Settings,
+    trial: Trial,
+    base_refusals: int,
+    bad_prompts: list[Prompt],
+) -> Path:
+    """Create or update a local model card with visible method provenance."""
+
+    readme_path = Path(save_directory) / "README.md"
+    start_marker = "<!-- HERETIC-AQUA-PROVENANCE:START -->"
+    end_marker = "<!-- HERETIC-AQUA-PROVENANCE:END -->"
+    provenance = (
+        f"{start_marker}\n"
+        f"{get_readme_intro(settings, trial, base_refusals, bad_prompts)}"
+        f"{end_marker}\n\n"
+    )
+
+    existing = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
+    if start_marker in existing and end_marker in existing:
+        prefix, remainder = existing.split(start_marker, maxsplit=1)
+        _, suffix = remainder.split(end_marker, maxsplit=1)
+        contents = prefix + provenance + suffix.lstrip("\n")
+    else:
+        contents = provenance + existing
+
+    readme_path.write_text(contents, encoding="utf-8")
+    return readme_path

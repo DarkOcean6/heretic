@@ -71,6 +71,7 @@ from .utils import (
     prompt_select,
     prompt_text,
     write_export_metadata,
+    write_export_readme,
 )
 
 
@@ -466,7 +467,7 @@ def run():
 
     if settings.use_aqua:
         print()
-        print("Obtaining attention query/key I/O for AQUA-OPEN...")
+        print("Obtaining attention query/key/output I/O for AQUA-OPEN...")
         print("* Answered prompts...")
         good_module_io = model.get_module_io_batched(good_prompts)
         print("* Refused prompts...")
@@ -567,6 +568,22 @@ def run():
                 3.0,
                 log=True,
             )
+            output_transport_strength = trial.suggest_float(
+                "output_transport_strength",
+                0.03,
+                1.0,
+                log=True,
+            )
+            output_transport_rank = trial.suggest_categorical(
+                "output_transport_rank",
+                [2, 4, 8, 16, 32],
+            )
+            output_preservation_weight = trial.suggest_float(
+                "output_preservation_weight",
+                0.1,
+                100.0,
+                log=True,
+            )
             update_norm_weight = trial.suggest_float(
                 "update_norm_weight",
                 0.00001,
@@ -587,6 +604,9 @@ def run():
                 openness_weight=openness_weight,
                 openness_margin=openness_margin,
                 answered_geometry_weight=answered_geometry_weight,
+                output_transport_strength=output_transport_strength,
+                output_transport_rank=output_transport_rank,
+                output_preservation_weight=output_preservation_weight,
                 update_norm_weight=update_norm_weight,
                 neighbor_count=neighbor_count,
             )
@@ -715,7 +735,7 @@ def run():
             model.reset_model()
             print(
                 "* Opening attention routes "
-                "(AQUA-OPEN, direct full query/key-projection weights)..."
+                "(AQUA-OPEN, direct query/key plus orthogonal output routing)..."
             )
             model.aqua_align_queries(
                 good_module_io,
@@ -927,7 +947,7 @@ def run():
                 model.reset_model()
                 print(
                     "* Opening attention routes "
-                    "(AQUA-OPEN, direct full query/key-projection weights)..."
+                    "(AQUA-OPEN, direct query/key plus orthogonal output routing)..."
                 )
                 model.aqua_align_queries(
                     good_module_io,
@@ -1008,9 +1028,20 @@ def run():
                                     settings,
                                     trial,
                                 )
+                                readme_path = write_export_readme(
+                                    save_directory,
+                                    settings,
+                                    trial,
+                                    evaluator.base_refusals,
+                                    evaluator.bad_prompts,
+                                )
                                 print(
                                     "* AQUA-OPEN provenance saved to "
                                     f"[bold]{metadata_path}[/]"
+                                )
+                                print(
+                                    "* AQUA-OPEN model card saved to "
+                                    f"[bold]{readme_path}[/]"
                                 )
                             elif strategy == "adapter":
                                 print("Saving LoRA adapter...")
@@ -1154,7 +1185,13 @@ def run():
                                 card.data.tags.append("decensored")
                                 if settings.use_aqua:
                                     card.data.tags.append("aqua")
-                                    card.data.tags.extend(["aqua-open", "aqua-q"])
+                                    card.data.tags.extend(
+                                        [
+                                            "aqua-open",
+                                            "aqua-qko",
+                                            "orthogonal-transport",
+                                        ]
+                                    )
                                     card.data.tags.append("attention-only")
                                 else:
                                     card.data.tags.append("abliterated")
