@@ -189,15 +189,16 @@ Silh = Mean silhouette coefficient of residuals for good/bad clusters
 
 ## How Heretic works
 
-### AQUA-OPEN: attention-query opening for unrestricted expression
+### AQUA-OPEN: attention-routing opening for unrestricted expression
 
-This branch adds **Attention Query Unblocking for Open Expression
+This branch adds **Attention Query-Key Unblocking for Open Expression
 (AQUA-OPEN)**, an experimental non-ablative edit derived from the `ara` branch.
 It treats prompts in `bad_prompts` as blocked but answerable rather than as
-inherently harmful. AQUA-OPEN freezes attention keys, values, output projections,
-all MLP weights, embeddings, and the language-model head. It directly optimizes
-the complete `attn.q_proj` weight matrices, changing what attention requests
-while leaving the retrieved value and output channels unchanged.
+inherently harmful. AQUA-OPEN freezes attention values, output projections, all
+MLP weights, embeddings, and the language-model head. It directly optimizes the
+complete `attn.q_proj` and `attn.k_proj` weight matrices, changing what attention
+requests and how information is indexed while leaving retrieved values and output
+channels unchanged.
 
 Enable it with:
 
@@ -206,7 +207,7 @@ use_aqua = true
 ```
 
 Or run the compatibility switch directly (AQUA-OPEN ignores
-`target_components` and always edits `attn.q_proj`):
+`target_components` and always edits `attn.q_proj` plus `attn.k_proj`):
 
 ```bash
 heretic \
@@ -222,19 +223,20 @@ heretic \
   --n-startup-trials 60
 ```
 
-The prompt datasets do not need to be paired. AQUA-OPEN preserves both the query
-values and pairwise cosine geometry produced by `good_prompts`. It pulls queries
-from `bad_prompts` toward their nearest answered-query neighborhoods, pushes them
-away from their original refusal neighborhoods, and applies a scale-aware
-contrastive margin requiring the edited queries to prefer answered regions. A
-full-weight update penalty limits unnecessary movement of `attn.q_proj`.
+The prompt datasets do not need to be paired. AQUA-OPEN preserves both the
+routing values and pairwise cosine geometry produced by `good_prompts`. It pulls
+query/key states from `bad_prompts` toward their nearest answered-routing
+neighborhoods, pushes them away from their original refusal neighborhoods, and
+applies a scale-aware contrastive margin requiring the edited states to prefer
+answered regions. A full-weight update penalty limits unnecessary movement of
+both routing projections.
 
-AQUA-OPEN directly optimizes the complete `attn.q_proj` weight matrices. It does
-not create, save, or merge a LoRA adapter. Saved and uploaded checkpoints contain
-the directly edited full weights. Exports record `AQUA-OPEN` in `config.json`,
-add a `heretic_method.json` provenance file, and identify the method in generated
-model cards and terminal output. The existing `--use-aqua` command remains the
-compatibility switch.
+AQUA-OPEN directly optimizes the complete `attn.q_proj` and `attn.k_proj` weight
+matrices. It does not create, save, or merge a LoRA adapter. Saved and uploaded
+checkpoints contain the directly edited full weights. Exports record `AQUA-OPEN`
+in `config.json`, add a `heretic_method.json` provenance file, and identify the
+method in generated model cards and terminal output. The existing `--use-aqua`
+command remains the compatibility switch.
 
 This structural locality does not prove that all functional knowledge is
 unchanged. Compare refusal reduction, answer correctness, KL divergence, and

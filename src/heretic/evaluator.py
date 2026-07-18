@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import math
+
 import lm_eval
 import torch.nn.functional as F
 from lm_eval.models.huggingface import HFLM
@@ -118,6 +120,10 @@ class Evaluator:
                 reduction="batchmean",
                 log_target=True,
             ).item()
+            if not math.isfinite(kl_divergence):
+                raise FloatingPointError(
+                    "the edited model produced a non-finite KL divergence"
+                )
             print(f"  * KL divergence: [bold]{kl_divergence:.4f}[/]")
 
         print("  * Counting model refusals...")

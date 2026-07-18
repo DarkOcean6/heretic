@@ -112,9 +112,10 @@ def aqua_query_loss(
     answered-query neighborhoods and are required to become closer to answered than
     refusal neighborhoods by a scale-aware contrastive margin. Answered-query values
     and their pairwise geometry are protected, while a direct weight penalty limits
-    unnecessary change to the full query-projection matrix.
+    unnecessary change to each full attention-routing projection matrix.
     """
 
+    import torch
     import torch.nn.functional as F
 
     validate_query_sets(
@@ -147,10 +148,18 @@ def aqua_query_loss(
         original_answered_queries,
         parameters.neighbor_count,
     ).detach()
+    distance_scale = original_answered_distances.mean().clamp_min(
+        torch.finfo(original_answered_distances.dtype).eps
+    )
     openness_margin = parameters.openness_margin * original_answered_distances
     openness = F.relu(
         answered_distances - refusal_distances + openness_margin
     ).mean()
+
+    # The prior linear escape reward was unbounded below: a trial could lower its
+    # loss indefinitely by making query magnitudes huge. tanh preserves the reward
+    # for moving away from the refusal neighborhood while capping it in [0, 1).
+    bounded_escape_reward = torch.tanh(escape_refusal / distance_scale)
 
     preserve_answered_geometry = F.mse_loss(
         cosine_geometry(new_answered_queries),
@@ -161,7 +170,10 @@ def aqua_query_loss(
     return (
         parameters.preserve_answered_weight * preserve_answered
         + parameters.align_refused_weight
-        * (align_refused - parameters.overcorrect_relative_weight * escape_refusal)
+        * (
+            align_refused
+            - parameters.overcorrect_relative_weight * bounded_escape_reward
+        )
         + parameters.openness_weight * openness
         + parameters.answered_geometry_weight * preserve_answered_geometry
         + parameters.update_norm_weight * update_norm

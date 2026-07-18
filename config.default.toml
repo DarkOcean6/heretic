@@ -62,10 +62,10 @@ kl_divergence_scale = 1.0
 # This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".
 kl_divergence_target = 0.01
 
-# Use Attention Query Unblocking for Open Expression (AQUA-OPEN). When enabled,
+# Use Attention Query-Key Unblocking for Open Expression (AQUA-OPEN). When enabled,
 # this takes precedence over ARA and directional ablation. AQUA-OPEN treats the
-# bad prompt set as blocked but answerable, directly edits full attn.q_proj
-# weight matrices, and does not create or merge a LoRA adapter.
+# bad prompt set as blocked but answerable, directly edits full attn.q_proj and
+# attn.k_proj weight matrices, and does not create or merge a LoRA adapter.
 use_aqua = false
 
 # Whether to adjust the refusal directions so that only the component that is

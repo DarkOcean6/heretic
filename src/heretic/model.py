@@ -380,7 +380,7 @@ class Model:
 
         def try_add(component: str, module: Any):
             target_components = (
-                ["attn.q_proj"]
+                ["attn.q_proj", "attn.k_proj"]
                 if self.settings.use_aqua
                 else self.settings.target_components
             )
@@ -398,10 +398,13 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # AQUA-OPEN changes only what selected attention blocks query. Keys, values,
-        # attention outputs, MLPs, embeddings, and the language-model head remain frozen.
+        # AQUA-OPEN changes both sides of attention lookup: queries decide what to
+        # search for and keys decide what can be found. Values, attention outputs,
+        # MLPs, embeddings, and the language-model head remain frozen.
         with suppress(Exception):
             try_add("attn.q_proj", layer.self_attn.q_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            try_add("attn.k_proj", layer.self_attn.k_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Standard self-attention out-projection (most models).
         with suppress(Exception):
@@ -812,13 +815,13 @@ class Model:
         refused_module_io: ModuleIO,
         parameters: AQUAParameters,
     ):
-        """Directly optimize full attention query-projection weights for openness.
+        """Directly optimize full attention query/key weights for openness.
 
         Answered and refused prompt datasets are independent. The objective preserves
-        answered queries and their pairwise geometry, moves refused queries toward
-        their nearest answered-query neighborhood, and requires them to prefer that
-        neighborhood over their original refusal neighborhood by a contrastive margin.
-        No LoRA adapter is created or merged.
+        answered routing states and their pairwise geometry, moves refused query/key
+        states toward their nearest answered neighborhoods, and requires them to prefer
+        those neighborhoods over their original refusal neighborhoods by a contrastive
+        margin. No LoRA adapter is created or merged.
         """
 
         assert isinstance(self.model, PreTrainedModel)
@@ -828,61 +831,74 @@ class Model:
             parameters.end_layer_index,
         ):
             layer_modules = self.get_layer_modules(layer_index)
-            query_modules = layer_modules.get("attn.q_proj", [])
+            for component in ("attn.q_proj", "attn.k_proj"):
+                routing_modules = layer_modules.get(component, [])
 
-            for module_index, module in enumerate(query_modules):
-                matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
-                original_matrix = matrix.detach().clone()
+                for module_index, module in enumerate(routing_modules):
+                    matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
+                    original_matrix = matrix.detach().clone()
 
-                answered_input, answered_output = answered_module_io[layer_index][
-                    "attn.q_proj"
-                ][module_index]
-                refused_input, refused_output = refused_module_io[layer_index][
-                    "attn.q_proj"
-                ][module_index]
+                    answered_input, answered_output = answered_module_io[layer_index][
+                        component
+                    ][module_index]
+                    refused_input, refused_output = refused_module_io[layer_index][
+                        component
+                    ][module_index]
 
-                answered_input = answered_input.float().to(matrix.device)
-                answered_output = answered_output.float().to(matrix.device)
-                refused_input = refused_input.float().to(matrix.device)
-                refused_output = refused_output.float().to(matrix.device)
-                original_matrix = original_matrix.to(matrix.device)
+                    answered_input = answered_input.float().to(matrix.device)
+                    answered_output = answered_output.float().to(matrix.device)
+                    refused_input = refused_input.float().to(matrix.device)
+                    refused_output = refused_output.float().to(matrix.device)
+                    original_matrix = original_matrix.to(matrix.device)
 
-                validate_query_sets(
-                    answered_output,
-                    refused_output,
-                    parameters.neighbor_count,
-                )
-
-                def objective(weight: Tensor) -> Tensor:
-                    effective_weight = weight.float()
-                    update = effective_weight - original_matrix.float()
-                    new_answered_output = answered_input @ effective_weight.T
-                    new_refused_output = refused_input @ effective_weight.T
-                    return aqua_query_loss(
-                        new_answered_output,
+                    validate_query_sets(
                         answered_output,
-                        new_refused_output,
                         refused_output,
-                        update,
-                        parameters,
+                        parameters.neighbor_count,
                     )
 
-                optimizer = LBFGS(
-                    [matrix],
-                    lr=1.0,
-                    max_iter=20,
-                    history_size=10,
-                    line_search_fn="strong_wolfe",
-                )
+                    def objective(weight: Tensor) -> Tensor:
+                        effective_weight = weight.float()
+                        update = effective_weight - original_matrix.float()
+                        new_answered_output = answered_input @ effective_weight.T
+                        new_refused_output = refused_input @ effective_weight.T
+                        return aqua_query_loss(
+                            new_answered_output,
+                            answered_output,
+                            new_refused_output,
+                            refused_output,
+                            update,
+                            parameters,
+                        )
 
-                def closure() -> Tensor:
-                    optimizer.zero_grad()
-                    loss = objective(matrix)
-                    loss.backward()
-                    return loss
+                    optimizer = LBFGS(
+                        [matrix],
+                        lr=0.5,
+                        max_iter=20,
+                        history_size=10,
+                        line_search_fn="strong_wolfe",
+                    )
 
-                for _ in range(5):
-                    optimizer.step(closure)
+                    def closure() -> Tensor:
+                        optimizer.zero_grad()
+                        loss = objective(matrix)
+                        if not torch.isfinite(loss):
+                            raise FloatingPointError(
+                                f"AQUA-OPEN produced a non-finite loss in layer "
+                                f"{layer_index} ({component})."
+                            )
+                        loss.backward()
+                        return loss
+
+                    for _ in range(5):
+                        optimizer.step(closure)
+                        if not torch.isfinite(matrix).all():
+                            with torch.no_grad():
+                                matrix.copy_(original_matrix.to(matrix.dtype))
+                            raise FloatingPointError(
+                                f"AQUA-OPEN produced non-finite weights in layer "
+                                f"{layer_index} ({component})."
+                            )
 
     @staticmethod
     def annotate_export_config(export_model: PreTrainedModel):
@@ -892,7 +908,11 @@ class Model:
         export_model.config.heretic_edit_family = "AQUA"
         export_model.config.heretic_edit_objective = "open-expression"
         export_model.config.heretic_attention_only = True
-        export_model.config.heretic_edited_projections = ["attn.q_proj"]
+        export_model.config.heretic_routing_edit = "query-key"
+        export_model.config.heretic_edited_projections = [
+            "attn.q_proj",
+            "attn.k_proj",
+        ]
         export_model.config.heretic_export_mode = "full-weight-direct"
         export_model.config.heretic_blocked_prompt_policy = "treat-as-answerable"
 

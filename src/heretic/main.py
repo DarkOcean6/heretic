@@ -466,7 +466,7 @@ def run():
 
     if settings.use_aqua:
         print()
-        print("Obtaining attention-query I/O for AQUA-OPEN...")
+        print("Obtaining attention query/key I/O for AQUA-OPEN...")
         print("* Answered prompts...")
         good_module_io = model.get_module_io_batched(good_prompts)
         print("* Refused prompts...")
@@ -569,8 +569,8 @@ def run():
             )
             update_norm_weight = trial.suggest_float(
                 "update_norm_weight",
-                0.000001,
-                0.01,
+                0.00001,
+                0.1,
                 log=True,
             )
             neighbor_count = trial.suggest_int(
@@ -715,7 +715,7 @@ def run():
             model.reset_model()
             print(
                 "* Opening attention routes "
-                "(AQUA-OPEN, direct full query-projection weights)..."
+                "(AQUA-OPEN, direct full query/key-projection weights)..."
             )
             model.aqua_align_queries(
                 good_module_io,
@@ -768,6 +768,9 @@ def run():
             # Stop the study gracefully on Ctrl+C.
             trial.study.stop()
             raise TrialPruned()
+        except FloatingPointError as error:
+            print(f"[yellow]* Pruning numerically invalid trial: {error}[/]")
+            raise TrialPruned() from error
 
     study = optuna.create_study(
         sampler=TPESampler(
@@ -924,7 +927,7 @@ def run():
                 model.reset_model()
                 print(
                     "* Opening attention routes "
-                    "(AQUA-OPEN, direct full query-projection weights)..."
+                    "(AQUA-OPEN, direct full query/key-projection weights)..."
                 )
                 model.aqua_align_queries(
                     good_module_io,
