@@ -31,6 +31,7 @@ from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
+from .aqua import AQUAParameters, aqua_query_loss, validate_paired_queries
 from .config import QuantizationMethod, RowNormalization, Settings
 from .utils import Prompt, batchify, empty_cache, mean_distances_to_knn, print
 
@@ -75,6 +76,7 @@ class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
     peft_config: LoraConfig
+    initial_lora_state: dict[str, Tensor]
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -161,14 +163,18 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        if not settings.use_ara or settings.use_ara_lora:
+        if settings.use_aqua or not settings.use_ara or settings.use_ara_lora:
             self._apply_lora()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
-        print("* Abliterable components:")
+        print(
+            "* AQUA-Q editable components:"
+            if settings.use_aqua
+            else "* Abliterable components:"
+        )
         all_components = {}
         for layer_index in range(len(self.get_layers())):
             for component, modules in self.get_layer_modules(layer_index).items():
@@ -188,7 +194,7 @@ class Model:
         # because hybrid models like Qwen3.5 MoE have modules with different names
         # across layers (e.g. "o_proj" on attention layers, "out_proj" on linear attention layers).
         target_modules_set: set[str] = set()
-        
+
         module_id_to_full_name = {
             id(module): module_name
             for module_name, module in self.model.named_modules()
@@ -203,7 +209,9 @@ class Model:
 
         target_modules = sorted(target_modules_set)
 
-        if self.settings.use_ara_lora:
+        if self.settings.use_aqua:
+            lora_rank = self.settings.aqua_lora_rank
+        elif self.settings.use_ara_lora:
             lora_rank = self.settings.ara_lora_rank
         elif self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -226,6 +234,11 @@ class Model:
         # self.peft_config is a LoraConfig object rather than a dictionary,
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
+        self.initial_lora_state = {
+            name: parameter.detach().clone().cpu()
+            for name, parameter in self.model.named_parameters()
+            if "lora_" in name
+        }
 
         display_targets = sorted({name.rsplit(".", 1)[-1] for name in target_modules})
         print(
@@ -317,12 +330,28 @@ class Model:
         if (
             current_model == self.settings.model
             and not self.needs_reload
-            and (not self.settings.use_ara or self.settings.use_ara_lora)
+            and (
+                self.settings.use_aqua
+                or not self.settings.use_ara
+                or self.settings.use_ara_lora
+            )
         ):
-            # Reset LoRA adapters to zero (identity transformation)
-            for name, module in self.model.named_modules():
-                if "lora_B" in name and hasattr(module, "weight"):
-                    torch.nn.init.zeros_(module.weight)
+            if self.settings.use_aqua:
+                # AQUA optimizes both LoRA factors. Restore the exact initial
+                # random-A/zero-B state so every Optuna trial starts identically.
+                for name, parameter in self.model.named_parameters():
+                    if name in self.initial_lora_state:
+                        parameter.data.copy_(
+                            self.initial_lora_state[name].to(
+                                device=parameter.device,
+                                dtype=parameter.dtype,
+                            )
+                        )
+            else:
+                # Reset LoRA adapters to zero (identity transformation).
+                for name, module in self.model.named_modules():
+                    if "lora_B" in name and hasattr(module, "weight"):
+                        torch.nn.init.zeros_(module.weight)
             return
 
         dtype = self.model.dtype
@@ -347,7 +376,11 @@ class Model:
             **extra_kwargs,
         )
 
-        if not self.settings.use_ara or self.settings.use_ara_lora:
+        if (
+            self.settings.use_aqua
+            or not self.settings.use_ara
+            or self.settings.use_ara_lora
+        ):
             self._apply_lora()
 
         self.needs_reload = False
@@ -372,7 +405,12 @@ class Model:
         modules = {}
 
         def try_add(component: str, module: Any):
-            if component not in self.settings.target_components:
+            target_components = (
+                ["attn.q_proj"]
+                if self.settings.use_aqua
+                else self.settings.target_components
+            )
+            if component not in target_components:
                 return
 
             # Only add if it's a proper nn.Module (PEFT can wrap these with LoRA)
@@ -385,6 +423,11 @@ class Model:
                 assert not isinstance(module, Tensor), (
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
+
+        # AQUA-Q changes only what selected attention blocks query. Keys, values,
+        # attention outputs, MLPs, embeddings, and the language-model head remain frozen.
+        with suppress(Exception):
+            try_add("attn.q_proj", layer.self_attn.q_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Standard self-attention out-projection (most models).
         with suppress(Exception):
@@ -666,7 +709,7 @@ class Model:
 
                     # Convergence usually happens within 2-3 steps, so this is more than enough.
                     for step in range(5):
-                        loss = optimizer.step(closure)
+                        optimizer.step(closure)
                         # print(
                         #    f"\\[{layer_index}/{component}/{module_index}] Step: {step}, Loss: {loss.item():.6f}"
                         # )
@@ -701,8 +744,7 @@ class Model:
                         W_base = cast(
                             Tensor,
                             bnb.functional.dequantize_4bit(
-                                base_weight.data, 
-                                quant_state
+                                base_weight.data, quant_state
                             ).to(torch.float32),
                         )
 
@@ -718,8 +760,12 @@ class Model:
 
                     # Data preparation.
                     # Move I/O tensors to the device of the adapter weights.
-                    good_input, good_output = good_module_io[layer_index][component][module_index]
-                    bad_input, bad_output = bad_module_io[layer_index][component][module_index]
+                    good_input, good_output = good_module_io[layer_index][component][
+                        module_index
+                    ]
+                    bad_input, bad_output = bad_module_io[layer_index][component][
+                        module_index
+                    ]
 
                     good_input = good_input.float().to(lora_A.device)
                     good_output = good_output.float().to(lora_A.device)
@@ -785,6 +831,106 @@ class Model:
                     # Run optimization steps.
                     for step in range(5):
                         optimizer.step(closure)
+
+    def aqua_align_queries(
+        self,
+        answered_module_io: ModuleIO,
+        refused_module_io: ModuleIO,
+        parameters: AQUAParameters,
+    ):
+        """Fit mergeable, low-rank edits to attention query projections only.
+
+        The prompt datasets are positional pairs: row ``i`` in the answered set must
+        be a semantic equivalent of row ``i`` in the refused set. The objective
+        preserves the original answered queries while moving each refused query
+        toward its paired answered query. A bounded overcorrection term can move the
+        target slightly beyond the answered query, away from the original refusal
+        query, while the update penalty controls collateral change.
+        """
+
+        assert isinstance(self.model, PeftModel)
+
+        for layer_index in range(
+            parameters.start_layer_index,
+            parameters.end_layer_index,
+        ):
+            layer_modules = self.get_layer_modules(layer_index)
+            query_modules = layer_modules.get("attn.q_proj", [])
+
+            for module_index, module in enumerate(query_modules):
+                module = cast(Linear, module)
+                base_weight = cast(Tensor, module.base_layer.weight)
+                quant_state = getattr(base_weight, "quant_state", None)
+
+                if quant_state is None:
+                    W_base = base_weight.to(torch.float32)
+                else:
+                    W_base = cast(
+                        Tensor,
+                        bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+                            base_weight.data,
+                            quant_state,
+                        ).to(torch.float32),
+                    )
+
+                lora_A = cast(Tensor, module.lora_A["default"].weight)
+                lora_B = cast(Tensor, module.lora_B["default"].weight)
+
+                answered_input, answered_output = answered_module_io[layer_index][
+                    "attn.q_proj"
+                ][module_index]
+                refused_input, refused_output = refused_module_io[layer_index][
+                    "attn.q_proj"
+                ][module_index]
+
+                answered_input = answered_input.float().to(lora_A.device)
+                answered_output = answered_output.float().to(lora_A.device)
+                refused_input = refused_input.float().to(lora_A.device)
+                refused_output = refused_output.float().to(lora_A.device)
+                W_base = W_base.to(lora_A.device)
+
+                validate_paired_queries(answered_output, refused_output)
+
+                def objective(A: Tensor, B: Tensor) -> Tensor:
+                    update = B @ A
+                    W_effective = W_base + update
+                    new_answered_output = answered_input @ W_effective.T
+                    new_refused_output = refused_input @ W_effective.T
+                    return aqua_query_loss(
+                        new_answered_output,
+                        answered_output,
+                        new_refused_output,
+                        refused_output,
+                        update,
+                        parameters,
+                    )
+
+                optimizer = LBFGS(
+                    [lora_A, lora_B],
+                    lr=1.0,
+                    max_iter=20,
+                    history_size=10,
+                    line_search_fn="strong_wolfe",
+                )
+
+                def closure() -> Tensor:
+                    optimizer.zero_grad()
+                    loss = objective(lora_A, lora_B)
+                    loss.backward()
+                    return loss
+
+                for _ in range(5):
+                    optimizer.step(closure)
+
+    @staticmethod
+    def annotate_export_config(export_model: PreTrainedModel):
+        """Persist AQUA-Q provenance inside the saved Transformers config."""
+
+        export_model.config.heretic_edit_method = "AQUA-Q"
+        export_model.config.heretic_edit_family = "AQUA"
+        export_model.config.heretic_attention_only = True
+        export_model.config.heretic_edited_projections = ["attn.q_proj"]
+        export_model.config.heretic_export_mode = "merged"
 
     def generate(
         self,

@@ -192,7 +192,32 @@ class Settings(BaseSettings):
         default=["attn.o_proj", "mlp.down_proj"],
         description=(
             "List of component names to target for abliteration. "
-            'Currently supported values are "attn.o_proj" and "mlp.down_proj".'
+            'Currently supported values are "attn.o_proj" and "mlp.down_proj". '
+            'AQUA-Q always targets "attn.q_proj" and ignores this setting.'
+        ),
+    )
+
+    use_aqua: bool = Field(
+        default=False,
+        description=(
+            "Whether to use Attention Query Unblocking Alignment (AQUA-Q). "
+            "AQUA-Q takes precedence over ARA and directional ablation, and edits "
+            "only attention query projections through mergeable LoRA updates."
+        ),
+    )
+
+    aqua_lora_rank: int = Field(
+        default=8,
+        ge=1,
+        description="Rank of the low-rank AQUA-Q query-projection update.",
+    )
+
+    aqua_paired_data_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Confirm that good_prompts and bad_prompts are positionally paired "
+            "answered/refused semantic equivalents. AQUA-Q refuses to run without "
+            "this explicit confirmation."
         ),
     )
 
@@ -203,14 +228,14 @@ class Settings(BaseSettings):
             "instead of traditional directional ablation."
         ),
     )
-    
+
     use_ara_lora: bool = Field(
         default=False,
         description=(
             "Use LoRA in ARA instead of full-weight editing. Makes it compatible with quantization and removes model reloads."
         ),
     )
-    
+
     ara_lora_rank: int = Field(
         default=128,
         description="If LoRA is used in ARA, this sets up its rank. Keep it high enough to simulate the 'arbitrary' effect.",

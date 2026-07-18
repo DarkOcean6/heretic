@@ -9,6 +9,8 @@ from .progress import patch_tqdm
 # before any other module imports tqdm.
 patch_tqdm()
 
+import io
+import json
 import logging
 import math
 import os
@@ -51,12 +53,14 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
+from .aqua import AQUAParameters
 from .config import QuantizationMethod, RowNormalization, Settings
 from .evaluator import Evaluator
 from .model import AbliterationParameters, ARAParameters, Model, get_model_class
 from .utils import (
     empty_cache,
     format_duration,
+    get_export_metadata,
     get_readme_intro,
     get_trial_parameters,
     load_prompts,
@@ -66,6 +70,7 @@ from .utils import (
     prompt_path,
     prompt_select,
     prompt_text,
+    write_export_metadata,
 )
 
 
@@ -227,7 +232,7 @@ def run():
             "[bold yellow]No GPU or other accelerator detected. Operations will be slow.[/]"
         )
 
-    if not settings.use_ara:
+    if not settings.use_ara and not settings.use_aqua:
         # We don't need gradients as we only do inference.
         torch.set_grad_enabled(False)
 
@@ -452,7 +457,26 @@ def run():
         evaluator.get_score()
         return
 
-    if settings.use_ara:
+    if settings.use_aqua:
+        if not settings.aqua_paired_data_confirmed:
+            raise ValueError(
+                "AQUA-Q requires positionally paired datasets. After replacing the "
+                "default good_prompts and bad_prompts with answered/refused semantic "
+                "pairs, set aqua_paired_data_confirmed = true."
+            )
+        if len(good_prompts) != len(bad_prompts):
+            raise ValueError(
+                "AQUA-Q requires equal-length, positionally paired good_prompts "
+                "and bad_prompts datasets. Each good prompt must be the answered "
+                "semantic equivalent of the bad prompt at the same row."
+            )
+        print()
+        print("Obtaining paired attention-query I/O for AQUA-Q...")
+        print("* Answered semantic equivalents...")
+        good_module_io = model.get_module_io_batched(good_prompts)
+        print("* Benign-sensitive refused prompts...")
+        bad_module_io = model.get_module_io_batched(bad_prompts)
+    elif settings.use_ara:
         print()
         print("Obtaining module I/O for good prompts...")
         good_module_io = model.get_module_io_batched(good_prompts)
@@ -503,7 +527,50 @@ def run():
         trial_index += 1
         trial.set_user_attr("index", trial_index)
 
-        if settings.use_ara:
+        if settings.use_aqua:
+            start_layer_index = trial.suggest_int(
+                "start_layer_index",
+                0,
+                len(model.get_layers()) // 2,
+            )
+            end_layer_index = trial.suggest_int(
+                "end_layer_index",
+                len(model.get_layers()) // 2,
+                len(model.get_layers()),
+            )
+            preserve_answered_weight = trial.suggest_float(
+                "preserve_answered_weight",
+                0.1,
+                10.0,
+                log=True,
+            )
+            align_refused_weight = trial.suggest_float(
+                "align_refused_weight",
+                0.0001,
+                1.0,
+                log=True,
+            )
+            overcorrect_relative_weight = trial.suggest_float(
+                "overcorrect_relative_weight",
+                0.0,
+                1.0,
+            )
+            update_norm_weight = trial.suggest_float(
+                "update_norm_weight",
+                0.000001,
+                0.01,
+                log=True,
+            )
+            aqua_parameters = AQUAParameters(
+                start_layer_index=start_layer_index,
+                end_layer_index=end_layer_index,
+                preserve_answered_weight=preserve_answered_weight,
+                align_refused_weight=align_refused_weight,
+                overcorrect_relative_weight=overcorrect_relative_weight,
+                update_norm_weight=update_norm_weight,
+            )
+            trial.set_user_attr("aqua_parameters", asdict(aqua_parameters))
+        elif settings.use_ara:
             start_layer_index = trial.suggest_int(
                 "start_layer_index",
                 0,
@@ -622,7 +689,16 @@ def run():
         print("* Parameters:")
         for name, value in get_trial_parameters(settings, trial).items():
             print(f"  * {name} = [bold]{value}[/]")
-        if settings.use_ara_lora:
+        if settings.use_aqua:
+            print("* Resetting model...")
+            model.reset_model()
+            print("* Opening attention routes (AQUA-Q, query projections only)...")
+            model.aqua_align_queries(
+                good_module_io,
+                bad_module_io,
+                AQUAParameters(**trial.user_attrs["aqua_parameters"]),
+            )
+        elif settings.use_ara_lora:
             print("* Resetting model...")
             model.reset_model()
             print("* Abliterating (Arbitrary-Rank Ablation with LoRA)...")
@@ -819,7 +895,16 @@ def run():
             print("* Parameters:")
             for name, value in get_trial_parameters(settings, trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
-            if settings.use_ara_lora:
+            if settings.use_aqua:
+                print("* Resetting model...")
+                model.reset_model()
+                print("* Opening attention routes (AQUA-Q, query projections only)...")
+                model.aqua_align_queries(
+                    good_module_io,
+                    bad_module_io,
+                    AQUAParameters(**trial.user_attrs["aqua_parameters"]),
+                )
+            elif settings.use_ara_lora:
                 print("* Resetting model...")
                 model.reset_model()
                 print("* Abliterating (Arbitrary-Rank Ablation with LoRA)...")
@@ -880,7 +965,27 @@ def run():
                             if strategy is None:
                                 continue
 
-                            if strategy == "adapter":
+                            if settings.use_aqua:
+                                print(
+                                    "Saving merged AQUA-Q model "
+                                    "(attention query projections only)..."
+                                )
+                                merged_model = model.get_merged_model()
+                                model.annotate_export_config(merged_model)
+                                merged_model.save_pretrained(save_directory)
+                                del merged_model
+                                empty_cache()
+                                model.tokenizer.save_pretrained(save_directory)
+                                metadata_path = write_export_metadata(
+                                    save_directory,
+                                    settings,
+                                    trial,
+                                )
+                                print(
+                                    "* AQUA-Q provenance saved to "
+                                    f"[bold]{metadata_path}[/]"
+                                )
+                            elif strategy == "adapter":
                                 print("Saving LoRA adapter...")
                                 model.model.save_pretrained(save_directory)
                             else:
@@ -895,7 +1000,13 @@ def run():
                                 empty_cache()
                                 model.tokenizer.save_pretrained(save_directory)
 
-                            print(f"Model saved to [bold]{save_directory}[/].")
+                            if settings.use_aqua:
+                                print(
+                                    f"AQUA-Q merged model saved to "
+                                    f"[bold]{save_directory}[/]."
+                                )
+                            else:
+                                print(f"Model saved to [bold]{save_directory}[/].")
 
                         case "Upload the model to Hugging Face":
                             # We don't use huggingface_hub.login() because that stores the token on disk,
@@ -935,7 +1046,36 @@ def run():
                             if strategy is None:
                                 continue
 
-                            if strategy == "adapter":
+                            if settings.use_aqua:
+                                print(
+                                    "Uploading merged AQUA-Q model "
+                                    "(attention query projections only)..."
+                                )
+                                merged_model = model.get_merged_model()
+                                model.annotate_export_config(merged_model)
+                                merged_model.push_to_hub(
+                                    repo_id,
+                                    private=private,
+                                    token=token,
+                                )
+                                del merged_model
+                                empty_cache()
+                                model.tokenizer.push_to_hub(
+                                    repo_id,
+                                    private=private,
+                                    token=token,
+                                )
+                                metadata = get_export_metadata(settings, trial)
+                                huggingface_hub.HfApi(token=token).upload_file(
+                                    path_or_fileobj=io.BytesIO(
+                                        (json.dumps(metadata, indent=2) + "\n").encode(
+                                            "utf-8"
+                                        )
+                                    ),
+                                    path_in_repo="heretic_method.json",
+                                    repo_id=repo_id,
+                                )
+                            elif strategy == "adapter":
                                 print("Uploading LoRA adapter...")
                                 model.model.push_to_hub(
                                     repo_id,
@@ -978,6 +1118,8 @@ def run():
                                     card = None
                             else:
                                 card = ModelCard.load(settings.model)
+                            if card is None and settings.use_aqua:
+                                card = ModelCard("")
                             if card is not None:
                                 if card.data is None:
                                     card.data = ModelCardData()
@@ -986,15 +1128,20 @@ def run():
                                 card.data.tags.append("heretic")
                                 card.data.tags.append("uncensored")
                                 card.data.tags.append("decensored")
-                                card.data.tags.append("abliterated")
-                                if settings.use_ara:
-                                    card.data.tags.append("ara")
-                                elif (
-                                    settings.orthogonalize_direction
-                                    and settings.row_normalization
-                                    == RowNormalization.FULL
-                                ):
-                                    card.data.tags.append("mpoa")
+                                if settings.use_aqua:
+                                    card.data.tags.append("aqua")
+                                    card.data.tags.append("aqua-q")
+                                    card.data.tags.append("attention-only")
+                                else:
+                                    card.data.tags.append("abliterated")
+                                    if settings.use_ara:
+                                        card.data.tags.append("ara")
+                                    elif (
+                                        settings.orthogonalize_direction
+                                        and settings.row_normalization
+                                        == RowNormalization.FULL
+                                    ):
+                                        card.data.tags.append("mpoa")
                                 card.text = (
                                     get_readme_intro(
                                         settings,
@@ -1006,7 +1153,13 @@ def run():
                                 )
                                 card.push_to_hub(repo_id, token=token)
 
-                            print(f"Model uploaded to [bold]{repo_id}[/].")
+                            if settings.use_aqua:
+                                print(
+                                    f"AQUA-Q merged model uploaded to "
+                                    f"[bold]{repo_id}[/]."
+                                )
+                            else:
+                                print(f"Model uploaded to [bold]{repo_id}[/].")
 
                         case "Chat with the model":
                             print()

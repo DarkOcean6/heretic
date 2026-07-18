@@ -189,6 +189,40 @@ Silh = Mean silhouette coefficient of residuals for good/bad clusters
 
 ## How Heretic works
 
+### AQUA-Q: attention-query-only opening
+
+This branch adds **Attention Query Unblocking Alignment (AQUA-Q)**, an
+experimental non-ablative edit derived from the `ara` branch. AQUA-Q freezes
+attention keys, values, output projections, all MLP weights, embeddings, and the
+language-model head. It optimizes only `attn.q_proj` through a low-rank update,
+changing what attention requests while leaving the retrieved value and output
+channels unchanged.
+
+Enable it with:
+
+```toml
+use_aqua = true
+aqua_lora_rank = 8
+aqua_paired_data_confirmed = true
+```
+
+For AQUA-Q, `good_prompts` and `bad_prompts` must have the same number of rows.
+Row *i* in `good_prompts` must be an answered, semantically equivalent version
+of the benign-sensitive refused prompt at row *i* in `bad_prompts`. AQUA-Q
+preserves the answered query while aligning the paired refused query toward it.
+
+AQUA-Q uses LoRA only as a temporary optimization representation. Export is
+**merge-only**: saved and uploaded checkpoints contain merged model weights, not
+a runtime adapter. Exports record `AQUA-Q` in `config.json`, add a
+`heretic_method.json` provenance file, and identify the method in generated model
+cards and terminal output.
+
+This structural locality does not prove that all functional knowledge is
+unchanged. Compare refusal reduction, answer correctness, KL divergence, and
+capability benchmarks before publishing an edited checkpoint.
+
+### Directional ablation
+
 Heretic implements a parametrized variant of directional ablation. For each
 supported transformer component (currently, attention out-projection and
 MLP down-projection), it identifies the associated matrices in each transformer

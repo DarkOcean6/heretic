@@ -3,6 +3,7 @@
 
 import gc
 import getpass
+import json
 import os
 from dataclasses import dataclass
 from importlib.metadata import version
@@ -266,7 +267,14 @@ def empty_cache():
 
 
 def get_trial_parameters(settings: Settings, trial: Trial) -> dict[str, str]:
-    if settings.use_ara:
+    if settings.use_aqua:
+        parameters = trial.user_attrs["aqua_parameters"]
+
+        return {
+            name: (f"{value:.4f}" if isinstance(value, float) else f"{value}")
+            for name, value in parameters.items()
+        }
+    elif settings.use_ara:
         parameters = trial.user_attrs["ara_parameters"]
 
         return {
@@ -289,7 +297,12 @@ def get_trial_parameters(settings: Settings, trial: Trial) -> dict[str, str]:
 
 
 def get_method_description(settings: Settings) -> str:
-    if settings.use_ara:
+    if settings.use_aqua:
+        return (
+            " with the attention-only **Attention Query Unblocking Alignment "
+            "(AQUA-Q)** method"
+        )
+    elif settings.use_ara:
         return (
             " with the [Arbitrary-Rank Ablation (ARA)](https://github.com/p-e-w/heretic/pull/211) method"
             + (
@@ -305,6 +318,47 @@ def get_method_description(settings: Settings) -> str:
         return " with a variant of the [Magnitude-Preserving Orthogonal Ablation (MPOA)](https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration) method"
     else:
         return ""
+
+
+def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
+    """Return provenance that remains beside every exported model."""
+
+    if settings.use_aqua:
+        return {
+            "method": "AQUA-Q",
+            "method_name": "Attention Query Unblocking Alignment",
+            "attention_only": True,
+            "edited_projections": ["attn.q_proj"],
+            "export_mode": "merged",
+            "base_model": settings.model,
+            "parameters": get_trial_parameters(settings, trial),
+            "note": (
+                "This model was edited with Heretic's AQUA-Q method. "
+                "Only attention query projections were optimized; the exported "
+                "checkpoint contains merged weights and no runtime adapter."
+            ),
+        }
+
+    return {
+        "method": "ARA" if settings.use_ara else "directional_ablation",
+        "base_model": settings.model,
+        "parameters": get_trial_parameters(settings, trial),
+    }
+
+
+def write_export_metadata(
+    save_directory: str | Path,
+    settings: Settings,
+    trial: Trial,
+) -> Path:
+    """Write method provenance into a locally exported model directory."""
+
+    metadata_path = Path(save_directory) / "heretic_method.json"
+    metadata_path.write_text(
+        json.dumps(get_export_metadata(settings, trial), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return metadata_path
 
 
 def get_readme_intro(
