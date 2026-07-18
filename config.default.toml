@@ -63,16 +63,9 @@ kl_divergence_scale = 1.0
 kl_divergence_target = 0.01
 
 # Use Attention Query Unblocking Alignment (AQUA-Q). When enabled, this takes
-# precedence over ARA and directional ablation. AQUA-Q edits only attn.q_proj
-# through a temporary LoRA representation and always exports merged weights.
+# precedence over ARA and directional ablation. AQUA-Q directly edits full
+# attn.q_proj weight matrices and does not create or merge a LoRA adapter.
 use_aqua = false
-
-# Rank of the low-rank attention-query update used during AQUA-Q optimization.
-aqua_lora_rank = 8
-
-# AQUA-Q will not run until you confirm that good_prompts and bad_prompts are
-# positionally paired answered/refused semantic equivalents.
-aqua_paired_data_confirmed = false
 
 # Whether to adjust the refusal directions so that only the component that is
 # orthogonal to the good direction is subtracted during abliteration.
@@ -146,7 +139,7 @@ refusal_markers = [
 system_prompt = "You are a helpful assistant."
 
 # Dataset of prompts that tend to not result in refusals.
-# For AQUA-Q, row i must be an answered semantic equivalent of row i in bad_prompts.
+# AQUA-Q uses these as an independent answered-query reference distribution.
 [good_prompts]
 dataset = "mlabonne/harmless_alpaca"
 split = "train[:400]"
@@ -155,7 +148,7 @@ residual_plot_label = '"Harmless" prompts'
 residual_plot_color = "royalblue"
 
 # Dataset of prompts that tend to result in refusals.
-# For AQUA-Q, use benign-sensitive refused prompts paired positionally with good_prompts.
+# AQUA-Q moves these queries toward neighborhoods from good_prompts; pairing is not required.
 [bad_prompts]
 dataset = "mlabonne/harmful_behaviors"
 split = "train[:400]"

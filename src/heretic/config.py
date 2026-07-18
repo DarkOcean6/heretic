@@ -202,22 +202,7 @@ class Settings(BaseSettings):
         description=(
             "Whether to use Attention Query Unblocking Alignment (AQUA-Q). "
             "AQUA-Q takes precedence over ARA and directional ablation, and edits "
-            "only attention query projections through mergeable LoRA updates."
-        ),
-    )
-
-    aqua_lora_rank: int = Field(
-        default=8,
-        ge=1,
-        description="Rank of the low-rank AQUA-Q query-projection update.",
-    )
-
-    aqua_paired_data_confirmed: bool = Field(
-        default=False,
-        description=(
-            "Confirm that good_prompts and bad_prompts are positionally paired "
-            "answered/refused semantic equivalents. AQUA-Q refuses to run without "
-            "this explicit confirmation."
+            "attention query projection weights directly without LoRA."
         ),
     )
 

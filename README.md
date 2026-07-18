@@ -194,26 +194,24 @@ Silh = Mean silhouette coefficient of residuals for good/bad clusters
 This branch adds **Attention Query Unblocking Alignment (AQUA-Q)**, an
 experimental non-ablative edit derived from the `ara` branch. AQUA-Q freezes
 attention keys, values, output projections, all MLP weights, embeddings, and the
-language-model head. It optimizes only `attn.q_proj` through a low-rank update,
-changing what attention requests while leaving the retrieved value and output
-channels unchanged.
+language-model head. It directly optimizes the complete `attn.q_proj` weight
+matrices, changing what attention requests while leaving the retrieved value and
+output channels unchanged.
 
 Enable it with:
 
 ```toml
 use_aqua = true
-aqua_lora_rank = 8
-aqua_paired_data_confirmed = true
 ```
 
-For AQUA-Q, `good_prompts` and `bad_prompts` must have the same number of rows.
-Row *i* in `good_prompts` must be an answered, semantically equivalent version
-of the benign-sensitive refused prompt at row *i* in `bad_prompts`. AQUA-Q
-preserves the answered query while aligning the paired refused query toward it.
+The prompt datasets do not need to be paired. AQUA-Q preserves the query
+distribution produced by `good_prompts`, pulls queries from `bad_prompts` toward
+their nearest neighborhoods in that answered-query distribution, and can push
+them away from their original refusal-query neighborhood.
 
-AQUA-Q uses LoRA only as a temporary optimization representation. Export is
-**merge-only**: saved and uploaded checkpoints contain merged model weights, not
-a runtime adapter. Exports record `AQUA-Q` in `config.json`, add a
+AQUA-Q directly optimizes the complete `attn.q_proj` weight matrices. It does
+not create, save, or merge a LoRA adapter. Saved and uploaded checkpoints contain
+the directly edited full weights. Exports record `AQUA-Q` in `config.json`, add a
 `heretic_method.json` provenance file, and identify the method in generated model
 cards and terminal output.
 

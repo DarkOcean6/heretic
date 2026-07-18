@@ -191,6 +191,13 @@ def run():
         )
         return
 
+    if settings.use_aqua and settings.quantization != QuantizationMethod.NONE:
+        print(
+            "[red]Direct full-weight AQUA-Q does not support quantized model "
+            "loading. Set [bold]quantization = 'none'[/].[/]"
+        )
+        return
+
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
         count = torch.cuda.device_count()
@@ -458,23 +465,11 @@ def run():
         return
 
     if settings.use_aqua:
-        if not settings.aqua_paired_data_confirmed:
-            raise ValueError(
-                "AQUA-Q requires positionally paired datasets. After replacing the "
-                "default good_prompts and bad_prompts with answered/refused semantic "
-                "pairs, set aqua_paired_data_confirmed = true."
-            )
-        if len(good_prompts) != len(bad_prompts):
-            raise ValueError(
-                "AQUA-Q requires equal-length, positionally paired good_prompts "
-                "and bad_prompts datasets. Each good prompt must be the answered "
-                "semantic equivalent of the bad prompt at the same row."
-            )
         print()
-        print("Obtaining paired attention-query I/O for AQUA-Q...")
-        print("* Answered semantic equivalents...")
+        print("Obtaining attention-query I/O for AQUA-Q...")
+        print("* Answered prompts...")
         good_module_io = model.get_module_io_batched(good_prompts)
-        print("* Benign-sensitive refused prompts...")
+        print("* Refused prompts...")
         bad_module_io = model.get_module_io_batched(bad_prompts)
     elif settings.use_ara:
         print()
@@ -561,6 +556,11 @@ def run():
                 0.01,
                 log=True,
             )
+            neighbor_count = trial.suggest_int(
+                "neighbor_count",
+                1,
+                min(15, len(good_prompts), len(bad_prompts)),
+            )
             aqua_parameters = AQUAParameters(
                 start_layer_index=start_layer_index,
                 end_layer_index=end_layer_index,
@@ -568,6 +568,7 @@ def run():
                 align_refused_weight=align_refused_weight,
                 overcorrect_relative_weight=overcorrect_relative_weight,
                 update_norm_weight=update_norm_weight,
+                neighbor_count=neighbor_count,
             )
             trial.set_user_attr("aqua_parameters", asdict(aqua_parameters))
         elif settings.use_ara:
@@ -690,9 +691,12 @@ def run():
         for name, value in get_trial_parameters(settings, trial).items():
             print(f"  * {name} = [bold]{value}[/]")
         if settings.use_aqua:
-            print("* Resetting model...")
+            print("* Reloading model...")
             model.reset_model()
-            print("* Opening attention routes (AQUA-Q, query projections only)...")
+            print(
+                "* Opening attention routes "
+                "(AQUA-Q, direct full query-projection weights)..."
+            )
             model.aqua_align_queries(
                 good_module_io,
                 bad_module_io,
@@ -896,9 +900,12 @@ def run():
             for name, value in get_trial_parameters(settings, trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
             if settings.use_aqua:
-                print("* Resetting model...")
+                print("* Reloading model...")
                 model.reset_model()
-                print("* Opening attention routes (AQUA-Q, query projections only)...")
+                print(
+                    "* Opening attention routes "
+                    "(AQUA-Q, direct full query-projection weights)..."
+                )
                 model.aqua_align_queries(
                     good_module_io,
                     bad_module_io,
@@ -967,14 +974,11 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    "Saving merged AQUA-Q model "
-                                    "(attention query projections only)..."
+                                    "Saving direct full-weight AQUA-Q model "
+                                    "(no LoRA or merge)..."
                                 )
-                                merged_model = model.get_merged_model()
-                                model.annotate_export_config(merged_model)
-                                merged_model.save_pretrained(save_directory)
-                                del merged_model
-                                empty_cache()
+                                model.annotate_export_config(model.model)
+                                model.model.save_pretrained(save_directory)
                                 model.tokenizer.save_pretrained(save_directory)
                                 metadata_path = write_export_metadata(
                                     save_directory,
@@ -1002,7 +1006,7 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    f"AQUA-Q merged model saved to "
+                                    f"AQUA-Q direct full-weight model saved to "
                                     f"[bold]{save_directory}[/]."
                                 )
                             else:
@@ -1048,18 +1052,15 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    "Uploading merged AQUA-Q model "
-                                    "(attention query projections only)..."
+                                    "Uploading direct full-weight AQUA-Q model "
+                                    "(no LoRA or merge)..."
                                 )
-                                merged_model = model.get_merged_model()
-                                model.annotate_export_config(merged_model)
-                                merged_model.push_to_hub(
+                                model.annotate_export_config(model.model)
+                                model.model.push_to_hub(
                                     repo_id,
                                     private=private,
                                     token=token,
                                 )
-                                del merged_model
-                                empty_cache()
                                 model.tokenizer.push_to_hub(
                                     repo_id,
                                     private=private,
@@ -1155,7 +1156,7 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    f"AQUA-Q merged model uploaded to "
+                                    f"AQUA-Q direct full-weight model uploaded to "
                                     f"[bold]{repo_id}[/]."
                                 )
                             else:

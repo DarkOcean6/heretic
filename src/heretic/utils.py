@@ -329,13 +329,13 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
             "method_name": "Attention Query Unblocking Alignment",
             "attention_only": True,
             "edited_projections": ["attn.q_proj"],
-            "export_mode": "merged",
+            "export_mode": "full-weight-direct",
             "base_model": settings.model,
             "parameters": get_trial_parameters(settings, trial),
             "note": (
                 "This model was edited with Heretic's AQUA-Q method. "
-                "Only attention query projections were optimized; the exported "
-                "checkpoint contains merged weights and no runtime adapter."
+                "Only attention query projections were optimized directly; the "
+                "checkpoint contains full edited weights with no LoRA adapter or merge."
             ),
         }
 

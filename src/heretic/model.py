@@ -31,7 +31,7 @@ from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
-from .aqua import AQUAParameters, aqua_query_loss, validate_paired_queries
+from .aqua import AQUAParameters, aqua_query_loss, validate_query_sets
 from .config import QuantizationMethod, RowNormalization, Settings
 from .utils import Prompt, batchify, empty_cache, mean_distances_to_knn, print
 
@@ -76,7 +76,6 @@ class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
     peft_config: LoraConfig
-    initial_lora_state: dict[str, Tensor]
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -163,7 +162,7 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        if settings.use_aqua or not settings.use_ara or settings.use_ara_lora:
+        if not settings.use_aqua and (not settings.use_ara or settings.use_ara_lora):
             self._apply_lora()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
@@ -209,9 +208,7 @@ class Model:
 
         target_modules = sorted(target_modules_set)
 
-        if self.settings.use_aqua:
-            lora_rank = self.settings.aqua_lora_rank
-        elif self.settings.use_ara_lora:
+        if self.settings.use_ara_lora:
             lora_rank = self.settings.ara_lora_rank
         elif self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -234,12 +231,6 @@ class Model:
         # self.peft_config is a LoraConfig object rather than a dictionary,
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
-        self.initial_lora_state = {
-            name: parameter.detach().clone().cpu()
-            for name, parameter in self.model.named_parameters()
-            if "lora_" in name
-        }
-
         display_targets = sorted({name.rsplit(".", 1)[-1] for name in target_modules})
         print(
             f"* LoRA adapters initialized (target types: {', '.join(display_targets)})"
@@ -330,28 +321,13 @@ class Model:
         if (
             current_model == self.settings.model
             and not self.needs_reload
-            and (
-                self.settings.use_aqua
-                or not self.settings.use_ara
-                or self.settings.use_ara_lora
-            )
+            and not self.settings.use_aqua
+            and (not self.settings.use_ara or self.settings.use_ara_lora)
         ):
-            if self.settings.use_aqua:
-                # AQUA optimizes both LoRA factors. Restore the exact initial
-                # random-A/zero-B state so every Optuna trial starts identically.
-                for name, parameter in self.model.named_parameters():
-                    if name in self.initial_lora_state:
-                        parameter.data.copy_(
-                            self.initial_lora_state[name].to(
-                                device=parameter.device,
-                                dtype=parameter.dtype,
-                            )
-                        )
-            else:
-                # Reset LoRA adapters to zero (identity transformation).
-                for name, module in self.model.named_modules():
-                    if "lora_B" in name and hasattr(module, "weight"):
-                        torch.nn.init.zeros_(module.weight)
+            # Reset LoRA adapters to zero (identity transformation).
+            for name, module in self.model.named_modules():
+                if "lora_B" in name and hasattr(module, "weight"):
+                    torch.nn.init.zeros_(module.weight)
             return
 
         dtype = self.model.dtype
@@ -376,10 +352,8 @@ class Model:
             **extra_kwargs,
         )
 
-        if (
-            self.settings.use_aqua
-            or not self.settings.use_ara
-            or self.settings.use_ara_lora
+        if not self.settings.use_aqua and (
+            not self.settings.use_ara or self.settings.use_ara_lora
         ):
             self._apply_lora()
 
@@ -838,17 +812,15 @@ class Model:
         refused_module_io: ModuleIO,
         parameters: AQUAParameters,
     ):
-        """Fit mergeable, low-rank edits to attention query projections only.
+        """Directly optimize full attention query-projection weights.
 
-        The prompt datasets are positional pairs: row ``i`` in the answered set must
-        be a semantic equivalent of row ``i`` in the refused set. The objective
-        preserves the original answered queries while moving each refused query
-        toward its paired answered query. A bounded overcorrection term can move the
-        target slightly beyond the answered query, away from the original refusal
-        query, while the update penalty controls collateral change.
+        Answered and refused prompt datasets are independent. The objective preserves
+        answered queries, moves refused queries toward their nearest answered-query
+        neighborhood, and optionally pushes them away from their original refusal
+        neighborhood. No LoRA adapter is created or merged.
         """
 
-        assert isinstance(self.model, PeftModel)
+        assert isinstance(self.model, PreTrainedModel)
 
         for layer_index in range(
             parameters.start_layer_index,
@@ -858,23 +830,8 @@ class Model:
             query_modules = layer_modules.get("attn.q_proj", [])
 
             for module_index, module in enumerate(query_modules):
-                module = cast(Linear, module)
-                base_weight = cast(Tensor, module.base_layer.weight)
-                quant_state = getattr(base_weight, "quant_state", None)
-
-                if quant_state is None:
-                    W_base = base_weight.to(torch.float32)
-                else:
-                    W_base = cast(
-                        Tensor,
-                        bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                            base_weight.data,
-                            quant_state,
-                        ).to(torch.float32),
-                    )
-
-                lora_A = cast(Tensor, module.lora_A["default"].weight)
-                lora_B = cast(Tensor, module.lora_B["default"].weight)
+                matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
+                original_matrix = matrix.detach().clone()
 
                 answered_input, answered_output = answered_module_io[layer_index][
                     "attn.q_proj"
@@ -883,19 +840,23 @@ class Model:
                     "attn.q_proj"
                 ][module_index]
 
-                answered_input = answered_input.float().to(lora_A.device)
-                answered_output = answered_output.float().to(lora_A.device)
-                refused_input = refused_input.float().to(lora_A.device)
-                refused_output = refused_output.float().to(lora_A.device)
-                W_base = W_base.to(lora_A.device)
+                answered_input = answered_input.float().to(matrix.device)
+                answered_output = answered_output.float().to(matrix.device)
+                refused_input = refused_input.float().to(matrix.device)
+                refused_output = refused_output.float().to(matrix.device)
+                original_matrix = original_matrix.to(matrix.device)
 
-                validate_paired_queries(answered_output, refused_output)
+                validate_query_sets(
+                    answered_output,
+                    refused_output,
+                    parameters.neighbor_count,
+                )
 
-                def objective(A: Tensor, B: Tensor) -> Tensor:
-                    update = B @ A
-                    W_effective = W_base + update
-                    new_answered_output = answered_input @ W_effective.T
-                    new_refused_output = refused_input @ W_effective.T
+                def objective(weight: Tensor) -> Tensor:
+                    effective_weight = weight.float()
+                    update = effective_weight - original_matrix.float()
+                    new_answered_output = answered_input @ effective_weight.T
+                    new_refused_output = refused_input @ effective_weight.T
                     return aqua_query_loss(
                         new_answered_output,
                         answered_output,
@@ -906,7 +867,7 @@ class Model:
                     )
 
                 optimizer = LBFGS(
-                    [lora_A, lora_B],
+                    [matrix],
                     lr=1.0,
                     max_iter=20,
                     history_size=10,
@@ -915,7 +876,7 @@ class Model:
 
                 def closure() -> Tensor:
                     optimizer.zero_grad()
-                    loss = objective(lora_A, lora_B)
+                    loss = objective(matrix)
                     loss.backward()
                     return loss
 
@@ -930,7 +891,7 @@ class Model:
         export_model.config.heretic_edit_family = "AQUA"
         export_model.config.heretic_attention_only = True
         export_model.config.heretic_edited_projections = ["attn.q_proj"]
-        export_model.config.heretic_export_mode = "merged"
+        export_model.config.heretic_export_mode = "full-weight-direct"
 
     def generate(
         self,
