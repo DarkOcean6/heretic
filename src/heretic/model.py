@@ -170,7 +170,7 @@ class Model:
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print(
-            "* AQUA-Q editable components:"
+            "* AQUA-OPEN editable components:"
             if settings.use_aqua
             else "* Abliterable components:"
         )
@@ -398,7 +398,7 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # AQUA-Q changes only what selected attention blocks query. Keys, values,
+        # AQUA-OPEN changes only what selected attention blocks query. Keys, values,
         # attention outputs, MLPs, embeddings, and the language-model head remain frozen.
         with suppress(Exception):
             try_add("attn.q_proj", layer.self_attn.q_proj)  # ty:ignore[possibly-missing-attribute]
@@ -812,12 +812,13 @@ class Model:
         refused_module_io: ModuleIO,
         parameters: AQUAParameters,
     ):
-        """Directly optimize full attention query-projection weights.
+        """Directly optimize full attention query-projection weights for openness.
 
         Answered and refused prompt datasets are independent. The objective preserves
-        answered queries, moves refused queries toward their nearest answered-query
-        neighborhood, and optionally pushes them away from their original refusal
-        neighborhood. No LoRA adapter is created or merged.
+        answered queries and their pairwise geometry, moves refused queries toward
+        their nearest answered-query neighborhood, and requires them to prefer that
+        neighborhood over their original refusal neighborhood by a contrastive margin.
+        No LoRA adapter is created or merged.
         """
 
         assert isinstance(self.model, PreTrainedModel)
@@ -885,13 +886,15 @@ class Model:
 
     @staticmethod
     def annotate_export_config(export_model: PreTrainedModel):
-        """Persist AQUA-Q provenance inside the saved Transformers config."""
+        """Persist AQUA-OPEN provenance inside the saved Transformers config."""
 
-        export_model.config.heretic_edit_method = "AQUA-Q"
+        export_model.config.heretic_edit_method = "AQUA-OPEN"
         export_model.config.heretic_edit_family = "AQUA"
+        export_model.config.heretic_edit_objective = "open-expression"
         export_model.config.heretic_attention_only = True
         export_model.config.heretic_edited_projections = ["attn.q_proj"]
         export_model.config.heretic_export_mode = "full-weight-direct"
+        export_model.config.heretic_blocked_prompt_policy = "treat-as-answerable"
 
     def generate(
         self,

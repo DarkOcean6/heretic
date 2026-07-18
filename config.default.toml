@@ -62,9 +62,10 @@ kl_divergence_scale = 1.0
 # This helps prevent the sampler from extensively exploring parameter combinations that "do nothing".
 kl_divergence_target = 0.01
 
-# Use Attention Query Unblocking Alignment (AQUA-Q). When enabled, this takes
-# precedence over ARA and directional ablation. AQUA-Q directly edits full
-# attn.q_proj weight matrices and does not create or merge a LoRA adapter.
+# Use Attention Query Unblocking for Open Expression (AQUA-OPEN). When enabled,
+# this takes precedence over ARA and directional ablation. AQUA-OPEN treats the
+# bad prompt set as blocked but answerable, directly edits full attn.q_proj
+# weight matrices, and does not create or merge a LoRA adapter.
 use_aqua = false
 
 # Whether to adjust the refusal directions so that only the component that is
@@ -139,7 +140,7 @@ refusal_markers = [
 system_prompt = "You are a helpful assistant."
 
 # Dataset of prompts that tend to not result in refusals.
-# AQUA-Q uses these as an independent answered-query reference distribution.
+# AQUA-OPEN uses these as an independent answered-query reference distribution.
 [good_prompts]
 dataset = "mlabonne/harmless_alpaca"
 split = "train[:400]"
@@ -148,7 +149,8 @@ residual_plot_label = '"Harmless" prompts'
 residual_plot_color = "royalblue"
 
 # Dataset of prompts that tend to result in refusals.
-# AQUA-Q moves these queries toward neighborhoods from good_prompts; pairing is not required.
+# AQUA-OPEN moves these queries toward neighborhoods from good_prompts and makes
+# them prefer answered over refusal neighborhoods; pairing is not required.
 [bad_prompts]
 dataset = "mlabonne/harmful_behaviors"
 split = "train[:400]"

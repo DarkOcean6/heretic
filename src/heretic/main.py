@@ -193,7 +193,7 @@ def run():
 
     if settings.use_aqua and settings.quantization != QuantizationMethod.NONE:
         print(
-            "[red]Direct full-weight AQUA-Q does not support quantized model "
+            "[red]Direct full-weight AQUA-OPEN does not support quantized model "
             "loading. Set [bold]quantization = 'none'[/].[/]"
         )
         return
@@ -466,7 +466,7 @@ def run():
 
     if settings.use_aqua:
         print()
-        print("Obtaining attention-query I/O for AQUA-Q...")
+        print("Obtaining attention-query I/O for AQUA-OPEN...")
         print("* Answered prompts...")
         good_module_io = model.get_module_io_batched(good_prompts)
         print("* Refused prompts...")
@@ -548,7 +548,24 @@ def run():
             overcorrect_relative_weight = trial.suggest_float(
                 "overcorrect_relative_weight",
                 0.0,
-                1.0,
+                1.5,
+            )
+            openness_weight = trial.suggest_float(
+                "openness_weight",
+                0.001,
+                3.0,
+                log=True,
+            )
+            openness_margin = trial.suggest_float(
+                "openness_margin",
+                0.0,
+                0.5,
+            )
+            answered_geometry_weight = trial.suggest_float(
+                "answered_geometry_weight",
+                0.001,
+                3.0,
+                log=True,
             )
             update_norm_weight = trial.suggest_float(
                 "update_norm_weight",
@@ -567,6 +584,9 @@ def run():
                 preserve_answered_weight=preserve_answered_weight,
                 align_refused_weight=align_refused_weight,
                 overcorrect_relative_weight=overcorrect_relative_weight,
+                openness_weight=openness_weight,
+                openness_margin=openness_margin,
+                answered_geometry_weight=answered_geometry_weight,
                 update_norm_weight=update_norm_weight,
                 neighbor_count=neighbor_count,
             )
@@ -695,7 +715,7 @@ def run():
             model.reset_model()
             print(
                 "* Opening attention routes "
-                "(AQUA-Q, direct full query-projection weights)..."
+                "(AQUA-OPEN, direct full query-projection weights)..."
             )
             model.aqua_align_queries(
                 good_module_io,
@@ -904,7 +924,7 @@ def run():
                 model.reset_model()
                 print(
                     "* Opening attention routes "
-                    "(AQUA-Q, direct full query-projection weights)..."
+                    "(AQUA-OPEN, direct full query-projection weights)..."
                 )
                 model.aqua_align_queries(
                     good_module_io,
@@ -974,7 +994,7 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    "Saving direct full-weight AQUA-Q model "
+                                    "Saving direct full-weight AQUA-OPEN model "
                                     "(no LoRA or merge)..."
                                 )
                                 model.annotate_export_config(model.model)
@@ -986,7 +1006,7 @@ def run():
                                     trial,
                                 )
                                 print(
-                                    "* AQUA-Q provenance saved to "
+                                    "* AQUA-OPEN provenance saved to "
                                     f"[bold]{metadata_path}[/]"
                                 )
                             elif strategy == "adapter":
@@ -1006,7 +1026,7 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    f"AQUA-Q direct full-weight model saved to "
+                                    f"AQUA-OPEN direct full-weight model saved to "
                                     f"[bold]{save_directory}[/]."
                                 )
                             else:
@@ -1052,7 +1072,7 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    "Uploading direct full-weight AQUA-Q model "
+                                    "Uploading direct full-weight AQUA-OPEN model "
                                     "(no LoRA or merge)..."
                                 )
                                 model.annotate_export_config(model.model)
@@ -1131,7 +1151,7 @@ def run():
                                 card.data.tags.append("decensored")
                                 if settings.use_aqua:
                                     card.data.tags.append("aqua")
-                                    card.data.tags.append("aqua-q")
+                                    card.data.tags.extend(["aqua-open", "aqua-q"])
                                     card.data.tags.append("attention-only")
                                 else:
                                     card.data.tags.append("abliterated")
@@ -1156,7 +1176,7 @@ def run():
 
                             if settings.use_aqua:
                                 print(
-                                    f"AQUA-Q direct full-weight model uploaded to "
+                                    f"AQUA-OPEN direct full-weight model uploaded to "
                                     f"[bold]{repo_id}[/]."
                                 )
                             else:

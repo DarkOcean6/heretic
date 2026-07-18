@@ -299,8 +299,8 @@ def get_trial_parameters(settings: Settings, trial: Trial) -> dict[str, str]:
 def get_method_description(settings: Settings) -> str:
     if settings.use_aqua:
         return (
-            " with the attention-only **Attention Query Unblocking Alignment "
-            "(AQUA-Q)** method"
+            " with the attention-only **Attention Query Unblocking for Open "
+            "Expression (AQUA-OPEN)** method"
         )
     elif settings.use_ara:
         return (
@@ -325,17 +325,26 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
 
     if settings.use_aqua:
         return {
-            "method": "AQUA-Q",
-            "method_name": "Attention Query Unblocking Alignment",
+            "method": "AQUA-OPEN",
+            "method_name": "Attention Query Unblocking for Open Expression",
             "attention_only": True,
             "edited_projections": ["attn.q_proj"],
             "export_mode": "full-weight-direct",
+            "blocked_prompt_policy": "treat_as_answerable",
+            "preservation_controls": [
+                "answered-query reconstruction",
+                "answered-query cosine geometry",
+                "full-weight update penalty",
+            ],
             "base_model": settings.model,
             "parameters": get_trial_parameters(settings, trial),
             "note": (
-                "This model was edited with Heretic's AQUA-Q method. "
-                "Only attention query projections were optimized directly; the "
-                "checkpoint contains full edited weights with no LoRA adapter or merge."
+                "This model was edited with Heretic's AQUA-OPEN method. Blocked "
+                "prompts were treated as answerable and their attention queries were "
+                "opened toward answered-query neighborhoods. Only attention query "
+                "projections were optimized directly; keys, values, output projections, "
+                "and MLP weights were left unchanged. The checkpoint contains full "
+                "edited weights with no LoRA adapter or merge."
             ),
         }
 
