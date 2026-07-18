@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import unittest
+import math
 
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ from heretic.aqua import (
     fit_protected_wall_rewire,
     fit_selective_output_update,
     nearest_neighbor_targets,
+    per_layer_relative_budget,
     validate_query_sets,
 )
 
@@ -45,6 +47,11 @@ class AQUATest(unittest.TestCase):
         refused = np.zeros((7, 3))
 
         validate_query_sets(answered, refused, neighbor_count=2)
+
+    def test_total_update_budget_is_shared_across_layers(self):
+        per_layer = per_layer_relative_budget(0.1, 4)
+
+        self.assertAlmostEqual(per_layer * math.sqrt(4), 0.1)
 
     def test_feature_width_mismatch_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "same feature width"):

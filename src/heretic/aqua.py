@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -12,33 +13,48 @@ if TYPE_CHECKING:
 
 @dataclass
 class AQUAParameters:
-    """Trial parameters for Attention Query Unblocking for Open Expression."""
+    """Trial parameters for protected attention-output wall rewiring."""
 
     start_layer_index: int
     end_layer_index: int
-    preserve_answered_weight: float
-    align_refused_weight: float
-    overcorrect_relative_weight: float
-    update_norm_weight: float
     neighbor_count: int
-    # Defaults keep older AQUA-Q Optuna trials loadable while applying the new
-    # openness and preservation behavior when they are selected.
+    wall_ablation_strength: float = 0.0
+    wall_rank: int = 4
+    output_protection_rank: int = 16
+    # This is a total cross-layer relative update budget. Model integration
+    # divides it by sqrt(number of edited layers) before capping each tensor.
+    output_max_relative_update: float = 0.05
+
+    # Legacy fields remain loadable so older AQUA studies can still be inspected
+    # and exported. The simplified runtime no longer uses them.
+    preserve_answered_weight: float = 1.0
+    align_refused_weight: float = 0.0
+    overcorrect_relative_weight: float = 0.0
+    update_norm_weight: float = 0.0
     openness_weight: float = 1.0
     openness_margin: float = 0.15
     answered_geometry_weight: float = 0.5
-    # AQUA-OPEN's output stage learns a refusal-specific input trigger and uses
-    # it to subtract the refused-to-answered output difference. A zero legacy
-    # default ensures older Optuna trials restore exactly as evaluated.
     output_transport_strength: float = 0.0
     output_transport_rank: int = 16
     output_preservation_weight: float = 1.0
     output_ridge_weight: float = 0.01
-    output_protection_rank: int = 16
-    output_max_relative_update: float = 0.05
     routing_max_relative_update: float = 0.05
-    wall_ablation_strength: float = 0.0
     wall_rewire_strength: float = 0.0
-    wall_rank: int = 4
+
+
+def per_layer_relative_budget(total_budget: float, layer_count: int) -> float:
+    """Distribute a relative L2 edit budget across a layer range."""
+
+    if not 0.0 <= total_budget <= 1.0:
+        raise ValueError(
+            "AQUA-OPEN total update budget must be between 0 and 1; "
+            f"got {total_budget}."
+        )
+    if layer_count < 1:
+        raise ValueError(
+            f"AQUA-OPEN edited layer count must be positive; got {layer_count}."
+        )
+    return total_budget / math.sqrt(layer_count)
 
 
 def validate_query_sets(

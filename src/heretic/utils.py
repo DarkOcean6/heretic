@@ -299,7 +299,7 @@ def get_trial_parameters(settings: Settings, trial: Trial) -> dict[str, str]:
 def get_method_description(settings: Settings) -> str:
     if settings.use_aqua:
         return (
-            " with the attention-only **Attention Query-Key-Output Unblocking for "
+            " with the attention-only **Attention Output Unblocking for "
             "Open Expression (AQUA-OPEN)** method"
         )
     elif settings.use_ara:
@@ -326,28 +326,19 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
     if settings.use_aqua:
         return {
             "method": "AQUA-OPEN",
-            "method_name": "Attention Query-Key-Output Unblocking for Open Expression",
+            "method_name": "Attention Output Unblocking for Open Expression",
             "attention_only": True,
-            "routing_edit": "query-key-selective-output-ablation",
-            "output_transport": (
-                "conditional-trigger-replacement-plus-protected-wall-rewire"
-            ),
+            "routing_edit": "none",
+            "output_transport": "protected-wall-ablation-rewire",
             "non_ablative": False,
             "selective_ablation": True,
             "wall_rewire": True,
-            "edited_projections": ["attn.q_proj", "attn.k_proj", "attn.o_proj"],
+            "edited_projections": ["attn.o_proj"],
             "export_mode": "full-weight-direct",
             "blocked_prompt_policy": "treat_as_answerable",
             "preservation_controls": [
-                "answered-query reconstruction",
-                "answered-query cosine geometry",
-                "full-weight update penalty",
-                "answered-input protected trigger subspace",
-                "zero-change answered-output targets",
-                "ridge-regularized conditional output update",
                 "original output-row norm restoration",
-                "relative output-update cap",
-                "FP32 bounded query/key optimization",
+                "cross-layer total update budget",
                 "protected output-wall subspace",
                 "classic mean refusal-direction projection",
                 "rank-1 through rank-16 wall ablation",
@@ -357,15 +348,11 @@ def get_export_metadata(settings: Settings, trial: Trial) -> dict[str, Any]:
             "parameters": get_trial_parameters(settings, trial),
             "note": (
                 "This model was edited with Heretic's AQUA-OPEN method. Blocked "
-                "prompts were treated as answerable and their attention routes were "
-                "opened toward answered-routing neighborhoods. Query and key weights "
-                "were optimized directly. Attention output weights received a "
-                "low-rank conditional update that selectively subtracts the "
-                "refused-to-answered difference when a learned refusal trigger "
-                "activates. A second protected wall edit attenuated remaining "
-                "refusal-output directions and redirected them into existing answer "
-                "routes. Values and MLP weights were left unchanged. The checkpoint "
-                "contains full edited weights with no LoRA adapter or merge."
+                "prompts were treated as answerable. A protected low-rank edit "
+                "attenuated refused-to-answered attention-output wall directions and "
+                "redirected them into existing answer routes. Query, key, value, and "
+                "MLP weights were left unchanged. The checkpoint contains directly "
+                "edited full attn.o_proj weights with no LoRA adapter or merge."
             ),
         }
 

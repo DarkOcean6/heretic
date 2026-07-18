@@ -46,7 +46,7 @@ from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.study import StudyDirection
-from optuna.trial import TrialState
+from optuna.trial import FrozenTrial, TrialState
 from pydantic import ValidationError
 from questionary import Choice, Style
 from rich.table import Table
@@ -467,7 +467,7 @@ def run():
 
     if settings.use_aqua:
         print()
-        print("Obtaining attention query/key/output I/O for AQUA-OPEN...")
+        print("Obtaining attention-output I/O for AQUA-OPEN...")
         print("* Answered prompts...")
         good_module_io = model.get_module_io_batched(good_prompts)
         print("* Refused prompts...")
@@ -524,136 +524,58 @@ def run():
         trial.set_user_attr("index", trial_index)
 
         if settings.use_aqua:
+            layer_count_choices = sorted({1, 2, 4, 8, min(12, len(model.get_layers()))})
             start_layer_index = trial.suggest_int(
                 "start_layer_index",
                 0,
-                len(model.get_layers()) // 2,
+                len(model.get_layers()) - 1,
             )
-            end_layer_index = trial.suggest_int(
-                "end_layer_index",
-                len(model.get_layers()) // 2,
+            layer_count = trial.suggest_categorical(
+                "aqua_layer_count",
+                layer_count_choices,
+            )
+            end_layer_index = min(
+                start_layer_index + layer_count,
                 len(model.get_layers()),
             )
-            preserve_answered_weight = trial.suggest_float(
-                "preserve_answered_weight",
-                0.1,
-                10.0,
-                log=True,
-            )
-            align_refused_weight = trial.suggest_float(
-                "align_refused_weight",
-                0.0001,
-                1.0,
-                log=True,
-            )
-            overcorrect_relative_weight = trial.suggest_float(
-                "overcorrect_relative_weight",
-                0.0,
-                1.5,
-            )
-            openness_weight = trial.suggest_float(
-                "openness_weight",
-                0.001,
-                3.0,
-                log=True,
-            )
-            openness_margin = trial.suggest_float(
-                "openness_margin",
-                0.0,
-                0.5,
-            )
-            answered_geometry_weight = trial.suggest_float(
-                "answered_geometry_weight",
-                0.001,
-                3.0,
-                log=True,
-            )
-            output_transport_strength = trial.suggest_float(
-                "output_transport_strength",
-                0.75,
-                3.0,
-                log=True,
-            )
-            output_transport_rank = trial.suggest_categorical(
-                "output_transport_rank",
-                [2, 4, 8, 16, 32],
-            )
-            output_preservation_weight = trial.suggest_float(
-                "output_preservation_weight",
-                0.1,
-                20.0,
-                log=True,
-            )
-            output_ridge_weight = trial.suggest_float(
-                "output_ridge_weight",
-                0.0001,
-                0.05,
-                log=True,
-            )
-            output_protection_rank = trial.suggest_categorical(
-                "output_protection_rank",
-                [0, 2, 4, 8],
-            )
-            output_max_relative_update = trial.suggest_float(
-                "output_max_relative_update",
-                0.1,
-                0.75,
-                log=True,
-            )
-            routing_max_relative_update = trial.suggest_float(
-                "routing_max_relative_update",
-                0.01,
-                0.2,
-                log=True,
-            )
-            wall_ablation_strength = trial.suggest_float(
-                "wall_ablation_strength",
-                0.75,
-                2.0,
-            )
-            wall_rewire_strength = trial.suggest_float(
-                "wall_rewire_strength",
-                0.5,
-                2.0,
-            )
             wall_rank = trial.suggest_categorical(
-                "wall_rank",
+                "aqua_rank",
                 [1, 2, 4, 8, 16],
             )
-            update_norm_weight = trial.suggest_float(
-                "update_norm_weight",
-                0.00001,
-                0.1,
+            output_protection_rank = trial.suggest_categorical(
+                "aqua_protection_rank",
+                [4, 8, 16, 32],
+            )
+            output_max_relative_update = trial.suggest_float(
+                "aqua_total_update_budget",
+                0.0005,
+                0.25,
                 log=True,
             )
-            neighbor_count = trial.suggest_int(
-                "neighbor_count",
-                1,
-                min(15, len(good_prompts), len(bad_prompts)),
-            )
+            neighbor_count = min(8, len(good_prompts), len(bad_prompts))
             aqua_parameters = AQUAParameters(
                 start_layer_index=start_layer_index,
                 end_layer_index=end_layer_index,
-                preserve_answered_weight=preserve_answered_weight,
-                align_refused_weight=align_refused_weight,
-                overcorrect_relative_weight=overcorrect_relative_weight,
-                openness_weight=openness_weight,
-                openness_margin=openness_margin,
-                answered_geometry_weight=answered_geometry_weight,
-                output_transport_strength=output_transport_strength,
-                output_transport_rank=output_transport_rank,
-                output_preservation_weight=output_preservation_weight,
-                output_ridge_weight=output_ridge_weight,
+                neighbor_count=neighbor_count,
+                wall_ablation_strength=1.0,
+                wall_rank=wall_rank,
                 output_protection_rank=output_protection_rank,
                 output_max_relative_update=output_max_relative_update,
-                routing_max_relative_update=routing_max_relative_update,
-                wall_ablation_strength=wall_ablation_strength,
-                wall_rewire_strength=wall_rewire_strength,
-                wall_rank=wall_rank,
-                update_norm_weight=update_norm_weight,
-                neighbor_count=neighbor_count,
             )
-            trial.set_user_attr("aqua_parameters", asdict(aqua_parameters))
+            trial.set_user_attr(
+                "aqua_parameters",
+                {
+                    "start_layer_index": aqua_parameters.start_layer_index,
+                    "end_layer_index": aqua_parameters.end_layer_index,
+                    "neighbor_count": aqua_parameters.neighbor_count,
+                    "wall_ablation_strength": (aqua_parameters.wall_ablation_strength),
+                    "wall_rank": aqua_parameters.wall_rank,
+                    "output_protection_rank": (aqua_parameters.output_protection_rank),
+                    "output_max_relative_update": (
+                        aqua_parameters.output_max_relative_update
+                    ),
+                },
+            )
         elif settings.use_ara:
             start_layer_index = trial.suggest_int(
                 "start_layer_index",
@@ -777,8 +699,8 @@ def run():
             print("* Reloading model...")
             model.reset_model()
             print(
-                "* Opening attention routes "
-                "(AQUA-OPEN, bounded routing plus selective wall ablation/rewiring)..."
+                "* Rewiring attention outputs "
+                "(AQUA-OPEN, protected output-wall ablation/rewiring)..."
             )
             model.aqua_align_queries(
                 good_module_io,
@@ -835,12 +757,23 @@ def run():
             print(f"[yellow]* Pruning numerically invalid trial: {error}[/]")
             raise TrialPruned() from error
 
+    sampler_arguments: dict[str, Any] = {
+        "n_startup_trials": settings.n_startup_trials,
+        "n_ei_candidates": 128,
+        "multivariate": True,
+    }
+    if settings.use_aqua and not settings.use_piqa:
+
+        def aqua_kl_constraint(trial: FrozenTrial) -> tuple[float]:
+            kl_divergence = trial.user_attrs.get("kl_divergence")
+            if kl_divergence is None or not math.isfinite(kl_divergence):
+                return (math.inf,)
+            return (kl_divergence - settings.kl_divergence_target,)
+
+        sampler_arguments["constraints_func"] = aqua_kl_constraint
+
     study = optuna.create_study(
-        sampler=TPESampler(
-            n_startup_trials=settings.n_startup_trials,
-            n_ei_candidates=128,
-            multivariate=True,
-        ),
+        sampler=TPESampler(**sampler_arguments),
         directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
         storage=storage,
         study_name="heretic",
@@ -989,8 +922,8 @@ def run():
                 print("* Reloading model...")
                 model.reset_model()
                 print(
-                    "* Opening attention routes "
-                    "(AQUA-OPEN, bounded routing plus selective wall ablation/rewiring)..."
+                    "* Rewiring attention outputs "
+                    "(AQUA-OPEN, protected output-wall ablation/rewiring)..."
                 )
                 model.aqua_align_queries(
                     good_module_io,
@@ -1231,9 +1164,8 @@ def run():
                                     card.data.tags.extend(
                                         [
                                             "aqua-open",
-                                            "aqua-qko",
+                                            "aqua-output-only",
                                             "selective-ablation",
-                                            "conditional-route-replacement",
                                             "protected-wall-rewire",
                                         ]
                                     )

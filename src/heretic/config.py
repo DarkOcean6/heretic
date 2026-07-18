@@ -193,20 +193,18 @@ class Settings(BaseSettings):
         description=(
             "List of component names to target for abliteration. "
             'Currently supported values are "attn.o_proj" and "mlp.down_proj". '
-            "AQUA-OPEN always targets attn.q_proj, attn.k_proj, and attn.o_proj "
-            "and ignores this setting."
+            "AQUA-OPEN always targets attn.o_proj and ignores this setting."
         ),
     )
 
     use_aqua: bool = Field(
         default=False,
         description=(
-            "Whether to use Attention Query-Key Unblocking for Open Expression "
+            "Whether to use Attention Output Unblocking for Open Expression "
             "(AQUA-OPEN). AQUA-OPEN takes precedence over ARA and directional "
-            "ablation, treats blocked prompts as answerable, and edits attention "
-            "bounded query/key weights directly and applies both a refusal-trigger-"
-            "selective output replacement and a protected wall-direction ablation/"
-            "rewire without LoRA."
+            "ablation, treats blocked prompts as answerable, and directly applies "
+            "a protected low-rank refusal-wall ablation and answer-route rewire to "
+            "attention output weights without LoRA."
         ),
     )
 

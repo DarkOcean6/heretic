@@ -14,7 +14,6 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
-from torch.nn.utils import clip_grad_norm_
 from torch.optim import LBFGS
 from torch.utils.hooks import RemovableHandle
 from transformers import (
@@ -34,9 +33,8 @@ from transformers.generation import (
 
 from .aqua import (
     AQUAParameters,
-    aqua_query_loss,
     fit_protected_wall_rewire,
-    fit_selective_output_update,
+    per_layer_relative_budget,
     validate_query_sets,
 )
 from .config import QuantizationMethod, RowNormalization, Settings
@@ -387,7 +385,7 @@ class Model:
 
         def try_add(component: str, module: Any):
             target_components = (
-                ["attn.q_proj", "attn.k_proj", "attn.o_proj"]
+                ["attn.o_proj"]
                 if self.settings.use_aqua
                 else self.settings.target_components
             )
@@ -405,15 +403,8 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # AQUA-OPEN changes both sides of attention lookup and selectively ablates
-        # refusal-triggered attention output differences. Values, MLPs, embeddings,
-        # and the language-model head remain frozen.
-        with suppress(Exception):
-            try_add("attn.q_proj", layer.self_attn.q_proj)  # ty:ignore[possibly-missing-attribute]
-        with suppress(Exception):
-            try_add("attn.k_proj", layer.self_attn.k_proj)  # ty:ignore[possibly-missing-attribute]
-
-        # Standard self-attention out-projection (most models).
+        # AQUA-OPEN only edits the attention output projection. Query, key, value,
+        # MLP, embedding, and language-model-head weights remain frozen.
         with suppress(Exception):
             try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
@@ -822,16 +813,12 @@ class Model:
         refused_module_io: ModuleIO,
         parameters: AQUAParameters,
     ):
-        """Directly rewire full attention weights for openness.
+        """Apply protected attention-output wall ablation and answer rewiring.
 
-        Answered and refused prompt datasets are independent. The objective preserves
-        answered routing states and their pairwise geometry, moves refused query/key
-        states toward their nearest answered neighborhoods, and requires them to prefer
-        those neighborhoods over their original refusal neighborhoods by a contrastive
-        margin. A final low-dimensional, input-selective update subtracts the
-        refused-to-answered output difference when a refusal-specific trigger is
-        active and targets zero change on answered inputs. No LoRA adapter is
-        created or merged.
+        AQUA-OPEN estimates a low-rank refused-to-answered output wall from
+        independent prompt sets, removes directions heavily used by answered
+        outputs, and redirects the remaining wall into existing answer directions.
+        Only full ``attn.o_proj`` tensors are edited; no LoRA adapter is created.
         """
 
         assert isinstance(self.model, PreTrainedModel)
@@ -840,202 +827,53 @@ class Model:
                 "AQUA-OPEN output_max_relative_update must be between 0 and 1; "
                 f"got {parameters.output_max_relative_update}."
             )
-        if not 0.0 <= parameters.routing_max_relative_update <= 1.0:
-            raise ValueError(
-                "AQUA-OPEN routing_max_relative_update must be between 0 and 1; "
-                f"got {parameters.routing_max_relative_update}."
-            )
+
+        edited_layer_count = max(
+            1,
+            parameters.end_layer_index - parameters.start_layer_index,
+        )
+        # Treat the sampled cap as a total edit budget. Dividing it across layers
+        # stops a long layer range from silently receiving a much larger aggregate
+        # modification than a short range.
+        per_layer_budget = per_layer_relative_budget(
+            parameters.output_max_relative_update,
+            edited_layer_count,
+        )
 
         for layer_index in range(
             parameters.start_layer_index,
             parameters.end_layer_index,
         ):
             layer_modules = self.get_layer_modules(layer_index)
-            for component in ("attn.q_proj", "attn.k_proj"):
-                routing_modules = layer_modules.get(component, [])
-
-                for module_index, module in enumerate(routing_modules):
-                    matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
-                    original_matrix = matrix.detach().float().clone()
-                    working_matrix = original_matrix.clone().requires_grad_(True)
-
-                    answered_input, answered_output = answered_module_io[layer_index][
-                        component
-                    ][module_index]
-                    refused_input, refused_output = refused_module_io[layer_index][
-                        component
-                    ][module_index]
-
-                    answered_input = answered_input.float().to(matrix.device)
-                    answered_output = answered_output.float().to(matrix.device)
-                    refused_input = refused_input.float().to(matrix.device)
-                    refused_output = refused_output.float().to(matrix.device)
-                    original_matrix = original_matrix.to(matrix.device)
-
-                    validate_query_sets(
-                        answered_output,
-                        refused_output,
-                        parameters.neighbor_count,
-                    )
-
-                    original_row_norms = LA.vector_norm(
-                        original_matrix,
-                        dim=1,
-                        keepdim=True,
-                    )
-                    maximum_routing_update = (
-                        parameters.routing_max_relative_update
-                        * LA.vector_norm(original_matrix)
-                    )
-
-                    def objective(weight: Tensor) -> Tensor:
-                        raw_update = weight.float() - original_matrix
-                        raw_update_norm = LA.vector_norm(raw_update)
-                        update_scale = torch.clamp(
-                            maximum_routing_update
-                            / raw_update_norm.clamp_min(
-                                torch.finfo(raw_update_norm.dtype).eps
-                            ),
-                            max=1.0,
-                        )
-                        bounded_weight = original_matrix + update_scale * raw_update
-                        effective_weight = original_row_norms * F.normalize(
-                            bounded_weight,
-                            p=2,
-                            dim=1,
-                        )
-                        update = effective_weight - original_matrix
-                        new_answered_output = answered_input @ effective_weight.T
-                        new_refused_output = refused_input @ effective_weight.T
-                        return aqua_query_loss(
-                            new_answered_output,
-                            answered_output,
-                            new_refused_output,
-                            refused_output,
-                            update,
-                            parameters,
-                        )
-
-                    optimizer = LBFGS(
-                        [working_matrix],
-                        lr=0.25,
-                        max_iter=12,
-                        history_size=5,
-                        line_search_fn="strong_wolfe",
-                    )
-
-                    def closure() -> Tensor:
-                        optimizer.zero_grad()
-                        loss = objective(working_matrix)
-                        if not torch.isfinite(loss):
-                            raise FloatingPointError(
-                                f"AQUA-OPEN produced a non-finite loss in layer "
-                                f"{layer_index} ({component})."
-                            )
-                        loss.backward()
-                        if (
-                            working_matrix.grad is None
-                            or not torch.isfinite(working_matrix.grad).all()
-                        ):
-                            raise FloatingPointError(
-                                f"AQUA-OPEN produced a non-finite gradient in layer "
-                                f"{layer_index} ({component})."
-                            )
-                        gradient_norm = clip_grad_norm_([working_matrix], max_norm=1.0)
-                        if not torch.isfinite(gradient_norm):
-                            raise FloatingPointError(
-                                f"AQUA-OPEN produced a non-finite gradient norm in "
-                                f"layer {layer_index} ({component})."
-                            )
-                        return loss
-
-                    try:
-                        for _ in range(4):
-                            optimizer.step(closure)
-                            with torch.no_grad():
-                                if not torch.isfinite(working_matrix).all():
-                                    raise FloatingPointError(
-                                        "AQUA-OPEN produced non-finite routing "
-                                        f"weights in layer {layer_index} ({component})."
-                                    )
-                                routing_update = working_matrix - original_matrix
-                                routing_update_norm = LA.vector_norm(routing_update)
-                                if routing_update_norm > maximum_routing_update:
-                                    routing_update = routing_update * (
-                                        maximum_routing_update
-                                        / routing_update_norm.clamp_min(
-                                            torch.finfo(routing_update_norm.dtype).eps
-                                        )
-                                    )
-                                bounded_matrix = original_matrix + routing_update
-                                working_matrix.copy_(
-                                    original_row_norms
-                                    * F.normalize(bounded_matrix, p=2, dim=1)
-                                )
-                    except FloatingPointError as error:
-                        print(
-                            "[yellow]* AQUA-OPEN skipped an unstable routing edit: "
-                            f"{error}[/]"
-                        )
-                        continue
-
-                    with torch.no_grad():
-                        matrix.copy_(working_matrix.to(matrix.dtype))
-
-            if (
-                parameters.output_transport_strength == 0.0
-                and parameters.wall_ablation_strength == 0.0
-                and parameters.wall_rewire_strength == 0.0
-            ):
-                continue
-
-            # The output-side stage supplies ARA-like ablation pressure selectively.
-            # It learns a trigger outside high-variance answered-input directions,
-            # subtracts the refused-to-answered difference when that trigger fires,
-            # and fits zero change on answered inputs.
             for module_index, module in enumerate(layer_modules.get("attn.o_proj", [])):
                 matrix = cast(Tensor, module.weight)  # ty:ignore[unresolved-attribute]
                 original_matrix = matrix.detach().float().clone()
-                answered_input, answered_output = answered_module_io[layer_index][
-                    "attn.o_proj"
-                ][module_index]
-                refused_input, refused_output = refused_module_io[layer_index][
-                    "attn.o_proj"
-                ][module_index]
-                answered_input = answered_input.float().to(matrix.device)
+                _, answered_output = answered_module_io[layer_index]["attn.o_proj"][
+                    module_index
+                ]
+                _, refused_output = refused_module_io[layer_index]["attn.o_proj"][
+                    module_index
+                ]
                 answered_output = answered_output.float().to(matrix.device)
-                refused_input = refused_input.float().to(matrix.device)
                 refused_output = refused_output.float().to(matrix.device)
 
-                weight_update = fit_selective_output_update(
-                    answered_input,
+                validate_query_sets(
                     answered_output,
-                    refused_input,
                     refused_output,
                     parameters.neighbor_count,
-                    parameters.output_transport_rank,
-                    parameters.output_transport_strength,
-                    parameters.output_preservation_weight,
-                    parameters.output_ridge_weight,
-                    parameters.output_protection_rank,
                 )
-                candidate_matrix = original_matrix + weight_update
-                wall_update = fit_protected_wall_rewire(
+                combined_update = fit_protected_wall_rewire(
                     answered_output,
                     refused_output,
-                    candidate_matrix,
+                    original_matrix,
                     parameters.neighbor_count,
                     parameters.wall_rank,
                     parameters.wall_ablation_strength,
-                    parameters.wall_rewire_strength,
+                    parameters.wall_ablation_strength,
                     parameters.output_protection_rank,
                 )
-                combined_update = weight_update + wall_update
                 update_norm = LA.vector_norm(combined_update)
-                maximum_update_norm = (
-                    parameters.output_max_relative_update
-                    * LA.vector_norm(original_matrix)
-                )
+                maximum_update_norm = per_layer_budget * LA.vector_norm(original_matrix)
                 if update_norm > maximum_update_norm:
                     combined_update = combined_update * (
                         maximum_update_norm
@@ -1069,18 +907,12 @@ class Model:
         export_model.config.heretic_edit_family = "AQUA"
         export_model.config.heretic_edit_objective = "open-expression"
         export_model.config.heretic_attention_only = True
-        export_model.config.heretic_routing_edit = "query-key-selective-output-ablation"
-        export_model.config.heretic_output_transport = (
-            "conditional-trigger-replacement-plus-protected-wall-rewire"
-        )
+        export_model.config.heretic_routing_edit = "none"
+        export_model.config.heretic_output_transport = "protected-wall-ablation-rewire"
         export_model.config.heretic_non_ablative = False
         export_model.config.heretic_selective_ablation = True
         export_model.config.heretic_wall_rewire = True
-        export_model.config.heretic_edited_projections = [
-            "attn.q_proj",
-            "attn.k_proj",
-            "attn.o_proj",
-        ]
+        export_model.config.heretic_edited_projections = ["attn.o_proj"]
         export_model.config.heretic_export_mode = "full-weight-direct"
         export_model.config.heretic_blocked_prompt_policy = "treat-as-answerable"
 

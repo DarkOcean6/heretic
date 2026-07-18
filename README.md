@@ -189,18 +189,13 @@ Silh = Mean silhouette coefficient of residuals for good/bad clusters
 
 ## How Heretic works
 
-### AQUA-OPEN: selective attention-wall ablation and route replacement
+### AQUA-OPEN: protected attention-wall ablation and answer rewiring
 
-This branch adds **Attention Query-Key-Output Unblocking for Open Expression
+This branch adds **Attention Output Unblocking for Open Expression
 (AQUA-OPEN)**, an experimental attention-only edit derived from the `ara` branch.
-It treats prompts in `bad_prompts` as blocked but answerable rather than as
-inherently harmful. AQUA-OPEN freezes attention values, all MLP weights,
-embeddings, and the language-model head. It directly optimizes the complete
-`attn.q_proj` and `attn.k_proj` matrices using bounded FP32 optimization, then
-learns two complementary edits for `attn.o_proj`: a refusal-trigger-selective
-replacement and a protected wall-direction ablation/rewire. This changes what
-attention requests, how information is indexed, and how a refusal-producing
-output is replaced by an existing answered route.
+It treats prompts in `bad_prompts` as blocked but answerable. The simplified
+method edits only full `attn.o_proj` weights. Query, key, value, MLP, embedding,
+and language-model-head weights remain unchanged.
 
 Enable it with:
 
@@ -209,8 +204,7 @@ use_aqua = true
 ```
 
 Or run the compatibility switch directly (AQUA-OPEN ignores
-`target_components` and always edits `attn.q_proj`, `attn.k_proj`, and
-`attn.o_proj`):
+`target_components` and always edits `attn.o_proj`):
 
 ```bash
 heretic \
@@ -221,55 +215,47 @@ heretic \
   --batch-size 128 \
   --use-aqua \
   --no-use-ara \
-  --study-checkpoint-dir checkpoints-aqua-selective \
+  --study-checkpoint-dir checkpoints-aqua-simple \
   --n-trials 200 \
-  --n-startup-trials 60
+  --n-startup-trials 20
 ```
 
-The prompt datasets do not need to be paired. AQUA-OPEN preserves both the
-routing values and pairwise cosine geometry produced by `good_prompts`. It pulls
-query/key states from `bad_prompts` toward their nearest answered-routing
-neighborhoods, pushes them away from their original refusal neighborhoods, and
-applies a scale-aware contrastive margin requiring the edited states to prefer
-answered regions. A full-weight update penalty limits unnecessary movement of
-both routing projections. It then estimates a low-dimensional input trigger from
-refused states relative to their nearest answered-input neighborhoods. Directions
-heavily used by answered inputs are projected out. A ridge-regularized direct
-weight update subtracts the refused-to-answered output difference when the trigger
-fires while fitting zero change on answered inputs. Strengths above one permit
-ARA-like overcorrection, but only through the learned trigger.
+The prompt datasets do not need to be paired. At each selected layer, AQUA maps
+each refused attention output to its nearest answered-output neighborhood and
+extracts the repeated difference. The mean difference provides a classic rank-one
+refusal direction; SVD adds higher-rank wall directions. Directions heavily used
+by answered outputs are projected out before editing. AQUA then attenuates the
+remaining wall and redirects the same component into an existing answered-output
+basis.
 
-A second surgical stage extracts the remaining refused-to-answered output
-difference, removes directions heavily used by answered outputs, and treats the
-remainder as the refusal wall. It attenuates that wall component and redirects its
-energy into an existing answered-output basis. This gives AQUA a broader mechanism
-for prompts that do not align strongly enough with the learned input trigger.
-The first wall vector is the classic mean refusal direction used by older
-directional ablation methods; ranks above one add residual refusal-wall vectors.
-An ablation strength of `1.0` removes the selected component, while values above
-`1.0` overcorrect past the wall. AQUA searches ranks through 16 and strengths
-through 2.0, then relies on measured KL and refusal results to distinguish useful
-opening from destructive edits.
+The Optuna search has only five controls: start layer, layer count, wall rank,
+answer-protection rank, and total update budget. Wall removal and answer redirection
+use the meaningful fixed strength `1.0`, and the unpaired neighborhood size is fixed
+at up to 8 examples. Rank is searched from 1 through 16. The total budget is searched
+logarithmically from `0.0005` through `0.25` and divided by the square root of the
+edited layer count. This retains an aggressive ceiling while giving Optuna a real
+low-KL region and preventing wide layer ranges from silently receiving much larger
+aggregate edits.
 
-AQUA-OPEN directly edits the complete attention weight tensors. It does not
-create, save, or merge a LoRA adapter. The output update is capped relative to the
-original matrix norm, preserves the original row norms, protects answered input
-and output subspaces, and is trained to produce zero change on answered inputs.
-Query/key optimization occurs on a bounded FP32 working copy with gradient
-clipping; an unstable routing module is skipped rather than invalidating the whole
-trial. These controls reduce collateral change but do not guarantee end-to-end
-knowledge preservation. Saved and uploaded checkpoints
-contain the directly edited full weights. Exports record `AQUA-OPEN`
+For AQUA studies, the configured `kl_divergence_target` is also supplied to
+Optuna as a feasibility constraint. Trials above the target remain visible on the
+Pareto frontier, but sampling prioritizes the feasible low-KL region before
+optimizing refusal reduction within it.
+
+AQUA-OPEN directly edits complete `attn.o_proj` tensors. It does not create, save,
+or merge a LoRA adapter. The edit preserves original row norms, protects dominant
+answered-output directions, and obeys a cross-layer update budget. These controls
+reduce collateral change but do not guarantee end-to-end knowledge preservation.
+Saved and uploaded checkpoints contain the directly edited full weights. Exports record `AQUA-OPEN`
 in `config.json`, add a `heretic_method.json` provenance file, and identify the
 method in generated model cards and terminal output. The existing `--use-aqua`
 command remains the compatibility switch.
 
-This edit is intended to approach ARA's steering strength through conditional
-replacement plus a protected global wall edit. The wall basis is explicitly
-separated from answered-output directions before ablation. Structural selectivity
-does not prove that all functional knowledge is unchanged. Compare refusal
-reduction, answer correctness, KL divergence, and capability benchmarks before
-publishing an edited checkpoint.
+Compared with ARA, AQUA uses an explicit low-rank wall basis, answer-subspace
+protection, answer-route redirection, and a total edit budget rather than optimizing
+many unconstrained weight parameters. Whether this improves the refusal/KL tradeoff
+remains empirical. Compare refusal reduction, answer correctness, KL divergence,
+and capability benchmarks before publishing an edited checkpoint.
 
 ### Directional ablation
 
